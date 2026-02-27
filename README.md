@@ -46,8 +46,9 @@ letitgo run
     │       └─ Apply whitelist (never exclude .env, application.yml, …)
     │
     ├─ Diff against cache  (HashSet subtract)
-    │       ├─ new paths → tmutil addexclusion path1 path2 …
-    │       └─ removed paths → tmutil removeexclusion path1 path2 …
+    │       ├─ new paths → set exclusion xattr directly (sticky mode)
+    │       │              or tmutil addexclusion -p (fixed-path mode)
+    │       └─ removed paths → remove xattr / tmutil removeexclusion
     │
     └─ Write cache atomically  (NamedTempFile + rename(2))
 ```
@@ -311,7 +312,7 @@ target/debug/     # then additionally exclude just the debug build
 
 | Mode | Config value | `sudo`? | Mechanism | Lost when item is deleted? |
 |------|-------------|---------|-----------|---------------------------|
-| **Sticky** *(default)* | `"sticky"` | No | Sets `com.apple.metadata:com_apple_backup_excludeItem` xattr | Yes — must re-run `letitgo run` |
+| **Sticky** *(default)* | `"sticky"` | No | Sets `com.apple.metadata:com_apple_backup_excludeItem` xattr directly (no `tmutil` subprocess) | Yes — must re-run `letitgo run` |
 | **Fixed-path** | `"fixed-path"` | Yes | Adds path to `/Library/Preferences/com.apple.TimeMachine.plist` | No — re-applies automatically |
 
 **Sticky** is the right choice for most users — no `sudo` needed, and `letitgo run`
@@ -401,7 +402,7 @@ Unit tests live alongside their modules in `src/`. Integration and smoke tests l
 in `tests/` (the idiomatic Rust location for external test crates):
 
 - `tests/integration.rs` — 26 tests using `MockExclusionManager`, zero system impact
-- `tests/smoke.rs` — 21 `#[ignore]` tests calling real `tmutil`, verifying xattrs
+- `tests/smoke.rs` — 22 `#[ignore]` tests calling real `tmutil`, verifying xattrs
 
 The CI workflows run on `macos-latest` (free for public repos):
 
@@ -410,7 +411,7 @@ The CI workflows run on `macos-latest` (free for public repos):
 | [`ci.yml`](.github/workflows/ci.yml) | Lint (`fmt` + `clippy`) and all 52 unit/integration tests (mock) |
 | [`smoke-core.yml`](.github/workflows/smoke-core.yml) | Real `tmutil`: dry-run, run, list, clean, idempotent re-run, reset |
 | [`smoke-lignore.yml`](.github/workflows/smoke-lignore.yml) | Real `tmutil`: `.lignore` negation/addition, nested `.lignore`, whitelist |
-| [`smoke-advanced.yml`](.github/workflows/smoke-advanced.yml) | Real `tmutil`: incremental diff, stale cleanup, multi-repo, nested `.gitignore`, file-level patterns, `init`, submodules, full cycle, pattern removal |
+| [`smoke-advanced.yml`](.github/workflows/smoke-advanced.yml) | Real `tmutil`: incremental diff, stale cleanup, multi-repo, nested `.gitignore`, file-level patterns, `init`, submodules, full cycle, pattern removal, xattr value verification |
 
 ---
 

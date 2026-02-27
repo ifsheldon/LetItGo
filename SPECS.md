@@ -270,7 +270,7 @@ exclusion_mode = "sticky"
 | Per-repo ignore resolution | I/O (small files) + CPU | `rayon::par_iter()` over discovered repos |
 | Reading/writing cache | I/O (single file) | Sequential — trivial, microseconds |
 | Reading config | I/O (single file) | Sequential — trivial |
-| Spawning `tmutil` processes | I/O (process spawn) | Sequential or `rayon` batched — only ~5-10 invocations |
+| Applying exclusions | Syscall (sticky) or process spawn (fixed-path) | Sequential — direct xattr set in sticky mode, `tmutil` subprocess in fixed-path mode |
 
 ### 5.2 How the `ignore` Crate Parallelizes Walking
 
@@ -300,6 +300,7 @@ The `ignore` crate (by BurntSushi, the ripgrep author) provides `WalkBuilder::bu
 | `globset` | Glob matching for whitelist patterns |
 | `path-clean` | Lexical path normalization (resolve `..` components without I/O) |
 | `tempfile` | Temp files for atomic cache writes |
+| `xattr` | Direct extended attribute read/write (bypass `tmutil` in sticky mode) |
 
 ### 5.4 Module Structure
 
@@ -322,7 +323,7 @@ src/
 └── error.rs           # Error types
 tests/
 ├── integration.rs     # 26 integration tests (MockExclusionManager, temp dirs)
-└── smoke.rs           # 21 #[ignore] smoke tests (real tmutil, macOS only)
+└── smoke.rs           # 22 #[ignore] smoke tests (real tmutil, macOS only)
 ```
 
 ---
@@ -348,17 +349,21 @@ tests/
  7. Diff against cache:
     - paths_to_add    = new_set - cached_set
     - paths_to_remove = cached_set - new_set
- 8. Batch tmutil calls — adds and removes are separate verbs but both accept
-    multiple paths per invocation. Chunk each set at ~200 paths/call to stay
-    well under macOS ARG_MAX (≈256 KB). The two sets are independent and can
-    run in parallel via std::thread::scope:
-    - paths_to_add in chunks    → tmutil addexclusion    [-p] path1 path2 ... path200
-    - paths_to_remove in chunks → tmutil removeexclusion [-p] path1 path2 ... path200
+ 8. Apply exclusions — the two sets (add/remove) are independent and run
+    in parallel via std::thread::scope.
+    **Sticky mode (default):** Exclusions are set/removed by writing/removing
+    the `com.apple.metadata:com_apple_backup_excludeItem` xattr directly
+    via the `xattr` crate (a single syscall per path, no subprocess overhead).
+    Paths that already carry the xattr are detected and skipped before any
+    writes, making idempotent re-runs essentially free.
+    **Fixed-path mode:** Falls back to `tmutil addexclusion -p` / `tmutil
+    removeexclusion -p` subprocesses, batched with a per-process timeout and
+    per-path retry on timeout.
     In practice the diff is usually small (a handful of paths), so most runs
-    produce only 1–2 tmutil invocations total. The initial run on a fresh machine
-    may have thousands of paths, making chunking important.
+    produce only a few operations total. The initial run on a fresh machine
+    may have thousands of paths.
     **Error handling:** If either add or remove fails, the error is propagated
-    and the cache is NOT written. This is safe because tmutil operations are
+    and the cache is NOT written. This is safe because operations are
     idempotent — the next run recomputes the full diff and retries everything.
     Paths that were successfully processed become harmless no-ops on retry.
  9. Write cache atomically (only on success of step 8): serialise new_set +
@@ -569,7 +574,7 @@ end
 
 1. **Nested Git repos** (submodules) — each should be scanned independently. The scanner detects `.git` entries that are either directories (regular repos) or files (submodules and worktrees use a `.git` file pointing to the actual git dir)
 2. **Symlinks** — do NOT follow them (avoid infinite loops)
-3. **Very large repos** — e.g. monorepos with thousands of ignored paths. Batch `tmutil` calls (200 paths per invocation)
+3. **Very large repos** — e.g. monorepos with thousands of ignored paths. In sticky mode, direct xattr syscalls handle this efficiently. In fixed-path mode, `tmutil` calls are batched with timeouts
 4. **Permission errors** — some dirs may not be readable. Log warning and skip
 5. **Concurrent runs** — all cache-mutating commands (`run`, `clean`, `reset`) acquire `~/Library/Caches/letitgo/letitgo.lock` before making changes. If a second instance can't acquire the lock, it logs a warning and exits gracefully.
 6. **Signal safety (Ctrl-C / SIGKILL)** — `flock(2)` advisory locks are per-open-file-description; the OS releases them automatically when the process exits, regardless of how it is killed (even SIGKILL, even without Rust `Drop` running). Cache writes are atomic (temp-file + `rename(2)`), so a killed process leaves no corrupt state — the previous cache file remains intact.
@@ -714,6 +719,7 @@ fn create_test_repo_with_lignore(root: &Path) -> PathBuf {
 - Core: dry-run no xattrs, run sets xattrs, list/clean/idempotent-rerun/reset
 - .lignore: negation, addition, combined, nested, whitelist (single + multi)
 - Advanced: incremental diff, stale cleanup, multi-repo, nested gitignore, file-level patterns, init, submodules, full cycle (run→reset→re-run), pattern removal
+- Verification: xattr value byte-for-byte match against `tmutil` output, `tmutil isexcluded` recognises directly-set xattr
 
 ### 10.6 Test Crates
 
