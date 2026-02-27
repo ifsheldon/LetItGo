@@ -40,9 +40,10 @@ letitgo run
     ├─ Scan search_paths for Git repos  (parallel, ignore::WalkBuilder)
     │
     ├─ For each repo: resolve excluded paths  (rayon parallel)
-    │       ├─ Pass 1: apply .gitignore rules (GitignoreBuilder + walkdir)
-    │       ├─ Pass 2: apply .lignore overrides (add or un-exclude paths)
-    │       └─ Pass 3: apply whitelist (never exclude .env, application.yml, …)
+    │       ├─ Single-pass walk: apply .gitignore rules incrementally
+    │       │     (discovers .gitignore files during traversal, prunes ignored dirs)
+    │       ├─ Apply .lignore overrides (add or un-exclude paths)
+    │       └─ Apply whitelist (never exclude .env, application.yml, …)
     │
     ├─ Diff against cache  (HashSet subtract)
     │       ├─ new paths → tmutil addexclusion path1 path2 …
@@ -211,7 +212,7 @@ Does nothing if the config already exists. Use `--force` to overwrite.
 |------|--------|
 | `-c, --config <PATH>` | Use a different config file |
 | `--dry-run` | Preview changes — no `tmutil` calls, no cache writes |
-| `-v / -vv / -vvv` | Increase log verbosity (INFO / DEBUG / TRACE) |
+| `-v / -vv` | Increase log verbosity (`-v` = DEBUG, `-vv` = TRACE) |
 | `-q, --quiet` | Suppress all output except errors |
 
 Logs go to **stderr**; `list` output goes to **stdout** — piping always works cleanly.
@@ -385,7 +386,7 @@ runs as root.
 # Build
 cargo build
 
-# Run all tests (61 tests, all using mock tmutil — zero system impact)
+# Run all tests (62 tests, all using mock tmutil — zero system impact)
 cargo test
 
 # Lint
@@ -400,7 +401,7 @@ are deleted automatically on test completion.
 The [CI workflow](.github/workflows/ci.yml) runs everything on `macos-latest` (free for public repos):
 
 - **Lint**: `cargo fmt --check` + `cargo clippy`
-- **Unit + integration tests**: all 61 tests with mock (zero system impact)
+- **Unit + integration tests**: all 62 tests with mock (zero system impact)
 - **Real tmutil smoke test**: `addexclusion` → `isexcluded` → `removeexclusion` against actual `tmutil`
 
 ---
