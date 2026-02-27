@@ -183,17 +183,62 @@ fn cmd_run(
         debug!("  {}", sp.display());
     }
 
-    // Detect mode switch
+    // Detect mode switch — block the run unless the user resets first
     let old_cache = load_cache(&ctx.cache_path)?;
     if old_cache.exclusion_mode != config.exclusion_mode && !old_cache.paths.is_empty() {
-        warn!(
+        if dry_run {
+            info!(
+                "[dry-run] Exclusion mode changed from `{}` to `{}`. \
+                 Run `letitgo reset` before switching modes.",
+                old_cache.exclusion_mode, config.exclusion_mode
+            );
+            return Ok(());
+        }
+        if !io::stdin().is_terminal() {
+            warn!(
+                "Exclusion mode changed from `{}` to `{}`. \
+                 Run `letitgo reset` first to clear old exclusions. Skipping.",
+                old_cache.exclusion_mode, config.exclusion_mode
+            );
+            return Ok(());
+        }
+
+        eprint!(
             "Exclusion mode changed from `{}` to `{}`. \
-             Run `letitgo reset` first to clear old exclusions.",
-            old_cache.exclusion_mode, config.exclusion_mode
+             Do you want to reset now?\n\
+             This will remove {} exclusion(s) previously set with `{}` mode \
+             and clear the cache, then continue with the scan. [y/N] ",
+            old_cache.exclusion_mode,
+            config.exclusion_mode,
+            old_cache.paths.len(),
+            old_cache.exclusion_mode,
+        );
+        io::stderr().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            info!("Aborted. Run `letitgo reset` manually before switching modes.");
+            return Ok(());
+        }
+
+        // Perform reset using the OLD mode flag so the correct tmutil verb is used
+        let old_fixed_path = old_cache.exclusion_mode.is_fixed_path();
+        let path_refs: Vec<&Path> = old_cache.paths.iter().map(|p| p.as_path()).collect();
+        ctx.exclusion_manager
+            .remove_exclusions(&path_refs, old_fixed_path)?;
+        if ctx.cache_path.exists() {
+            fs::remove_file(&ctx.cache_path).with_context(|| {
+                format!("removing cache during reset: {}", ctx.cache_path.display())
+            })?;
+        }
+        info!(
+            "Reset complete. {} exclusion(s) removed. Continuing with scan…",
+            old_cache.paths.len()
         );
     }
 
-    let old_set = old_cache.path_set();
+    // Reload cache after potential reset (may now be empty)
+    let old_set = load_cache(&ctx.cache_path)?.path_set();
 
     // 1) Discover repos
     let repos = discover_repos(&search_paths, &ignored_paths);
@@ -816,18 +861,99 @@ mod integration_tests {
     // ── run: mode-switch warning ────────────────────────────────────────────
 
     #[test]
-    fn test_run_mode_switch_does_not_crash() {
+    fn test_run_mode_switch_skips_in_non_interactive() {
         let tmp = tempdir().unwrap();
         make_repo(tmp.path(), "repo-mode");
         let config_sticky = default_config_for_test(tmp.path());
 
-        // First run with sticky
+        // First run with sticky — populates cache
         {
             let (ctx, _mock) = make_ctx_with_mock(tmp.path());
             cmd_run(&ctx, &config_sticky, &[], false).unwrap();
         }
 
-        // Second run with fixed-path — should emit a warning but not crash
+        // Second run with fixed-path (non-interactive) — should skip gracefully
+        let config_fixed = Config {
+            search_paths: vec![tmp.path().to_string_lossy().to_string()],
+            ignored_paths: vec![],
+            whitelist: vec![],
+            exclusion_mode: ExclusionMode::FixedPath,
+        };
+        {
+            let (ctx, mock) = make_ctx_with_mock(tmp.path());
+            cmd_run(&ctx, &config_fixed, &[], false).unwrap();
+
+            // Run was skipped — exclusion manager must not have been called
+            assert!(mock.added_paths().is_empty());
+            assert!(mock.removed_paths().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_run_mode_switch_dry_run_returns_early() {
+        let tmp = tempdir().unwrap();
+        make_repo(tmp.path(), "repo-mode-dry");
+        let config_sticky = default_config_for_test(tmp.path());
+
+        // First run with sticky — populates cache
+        {
+            let (ctx, _mock) = make_ctx_with_mock(tmp.path());
+            cmd_run(&ctx, &config_sticky, &[], false).unwrap();
+        }
+
+        // Dry-run with fixed-path — should return early without doing work
+        let config_fixed = Config {
+            search_paths: vec![tmp.path().to_string_lossy().to_string()],
+            ignored_paths: vec![],
+            whitelist: vec![],
+            exclusion_mode: ExclusionMode::FixedPath,
+        };
+        {
+            let (ctx, mock) = make_ctx_with_mock(tmp.path());
+            cmd_run(&ctx, &config_fixed, &[], true).unwrap();
+
+            assert!(mock.added_paths().is_empty());
+            assert!(mock.removed_paths().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_run_mode_switch_with_empty_cache_proceeds() {
+        // When cache is empty, mode switch should NOT block the run
+        let tmp = tempdir().unwrap();
+        make_repo(tmp.path(), "repo-mode-empty");
+
+        let config_fixed = Config {
+            search_paths: vec![tmp.path().to_string_lossy().to_string()],
+            ignored_paths: vec![],
+            whitelist: vec![],
+            exclusion_mode: ExclusionMode::FixedPath,
+        };
+        let (ctx, mock) = make_ctx_with_mock(tmp.path());
+        cmd_run(&ctx, &config_fixed, &[], false).unwrap();
+
+        // Should have processed normally — exclusions were added
+        assert!(!mock.added_paths().is_empty());
+    }
+
+    #[test]
+    fn test_run_mode_switch_preserves_old_cache_on_skip() {
+        let tmp = tempdir().unwrap();
+        make_repo(tmp.path(), "repo-mode-preserve");
+        let config_sticky = default_config_for_test(tmp.path());
+
+        // First run with sticky — populates cache
+        {
+            let (ctx, _mock) = make_ctx_with_mock(tmp.path());
+            cmd_run(&ctx, &config_sticky, &[], false).unwrap();
+        }
+
+        // Verify cache was written with sticky mode
+        let cache_before = load_cache(&tmp.path().join("cache.json")).unwrap();
+        assert_eq!(cache_before.exclusion_mode, ExclusionMode::Sticky);
+        assert!(!cache_before.paths.is_empty());
+
+        // Second run with fixed-path (non-interactive) — should skip
         let config_fixed = Config {
             search_paths: vec![tmp.path().to_string_lossy().to_string()],
             ignored_paths: vec![],
@@ -838,6 +964,11 @@ mod integration_tests {
             let (ctx, _mock) = make_ctx_with_mock(tmp.path());
             cmd_run(&ctx, &config_fixed, &[], false).unwrap();
         }
+
+        // Cache must be unchanged — still sticky, same paths
+        let cache_after = load_cache(&tmp.path().join("cache.json")).unwrap();
+        assert_eq!(cache_after.exclusion_mode, ExclusionMode::Sticky);
+        assert_eq!(cache_after.paths.len(), cache_before.paths.len());
     }
 
     // ── run: edge cases ─────────────────────────────────────────────────────
