@@ -2,6 +2,24 @@ use ignore::{WalkBuilder, WalkState};
 use std::{path::PathBuf, sync::Mutex};
 use tracing::{debug, warn};
 
+/// Thread-local buffer that merges into a shared `Mutex<Vec<PathBuf>>` on drop.
+///
+/// Each parallel-walker thread accumulates discovered repos locally, avoiding
+/// per-repo lock contention. The merge happens once per thread when the walker
+/// callback is dropped.
+struct RepoCollector<'a> {
+    local: Vec<PathBuf>,
+    global: &'a Mutex<Vec<PathBuf>>,
+}
+
+impl Drop for RepoCollector<'_> {
+    fn drop(&mut self) {
+        if !self.local.is_empty() {
+            self.global.lock().unwrap().append(&mut self.local);
+        }
+    }
+}
+
 /// Scan `search_paths` for Git repository roots in parallel using the `ignore`
 /// crate's parallel walker. Directories listed in `ignored_paths` are skipped.
 ///
@@ -26,7 +44,10 @@ pub fn discover_repos(search_paths: &[PathBuf], ignored_paths: &[PathBuf]) -> Ve
         let walker = builder.build_parallel();
 
         walker.run(|| {
-            let repos = &repos;
+            let mut collector = RepoCollector {
+                local: Vec::new(),
+                global: &repos,
+            };
 
             Box::new(move |result| {
                 let entry = match result {
@@ -52,7 +73,7 @@ pub fn discover_repos(search_paths: &[PathBuf], ignored_paths: &[PathBuf]) -> Ve
                     && let Some(repo_root) = path.parent()
                 {
                     debug!("Found repo: {}", repo_root.display());
-                    repos.lock().unwrap().push(repo_root.to_path_buf());
+                    collector.local.push(repo_root.to_path_buf());
                     return WalkState::Skip;
                 }
 
