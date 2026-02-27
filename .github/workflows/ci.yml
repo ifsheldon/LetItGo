@@ -44,7 +44,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # ── 1. Run all unit + integration tests (MockExclusionManager) on macOS ──
+      # ── 1. Build + run all unit + integration tests (MockExclusionManager) ──
+      - name: cargo build (debug binary for integration tests)
+        run: cargo build
+
       - name: cargo test (macOS)
         run: cargo test
 
