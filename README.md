@@ -398,11 +398,14 @@ The test suite uses a `MockExclusionManager` for all tests — no real `tmutil` 
 are made, no xattrs are set, and all file I/O is isolated to temp directories that
 are deleted automatically on test completion.
 
-The [CI workflow](.github/workflows/ci.yml) runs everything on `macos-latest` (free for public repos):
+The CI workflows run on `macos-latest` (free for public repos):
 
-- **Lint**: `cargo fmt --check` + `cargo clippy`
-- **Unit + integration tests**: all 67 tests with mock (zero system impact)
-- **Real tmutil smoke test**: `addexclusion` → `isexcluded` → `removeexclusion` against actual `tmutil`
+| Workflow | What it tests |
+|----------|--------------|
+| [`ci.yml`](.github/workflows/ci.yml) | Lint (`fmt` + `clippy`) and all 67 unit/integration tests (mock) |
+| [`smoke-core.yml`](.github/workflows/smoke-core.yml) | Real `tmutil`: dry-run, run, list, clean, idempotent re-run, reset |
+| [`smoke-lignore.yml`](.github/workflows/smoke-lignore.yml) | Real `tmutil`: `.lignore` negation/addition, nested `.lignore`, whitelist |
+| [`smoke-advanced.yml`](.github/workflows/smoke-advanced.yml) | Real `tmutil`: incremental diff, stale cleanup, multi-repo, nested `.gitignore`, file-level patterns, `init`, submodules, full cycle, pattern removal |
 
 ---
 

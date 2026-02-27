@@ -1,0 +1,110 @@
+name: "Smoke: core tmutil"
+
+# Real-tmutil smoke tests for the core happy path:
+# dry-run, run, list, clean, idempotent re-run, and reset.
+#
+# GitHub-hosted macOS runners include tmutil and allow sticky-mode
+# (xattr-based) exclusions without sudo.  We verify xattrs directly
+# instead of `tmutil isexcluded` because GitHub Actions pre-excludes
+# broad path trees on ancestor directories.
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["src/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
+  pull_request:
+    paths: ["src/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke-core:
+    name: Core smoke tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build
+
+      # ── Helpers ──────────────────────────────────────────────────────────────
+      - name: Create xattr helpers
+        run: |
+          cat > "$RUNNER_TEMP/h.sh" <<'EOF'
+          assert_xattr()    { xattr "$1" 2>/dev/null | grep -q com_apple_backup_excludeItem || { echo "FAIL: $2 — no xattr on $1"; exit 1; }; echo "OK: $2"; }
+          assert_no_xattr() { if xattr "$1" 2>/dev/null | grep -q com_apple_backup_excludeItem; then echo "FAIL: $2 — xattr on $1"; exit 1; fi; echo "OK: $2"; }
+          make_config() { printf 'search_paths = ["%s"]\nignored_paths = []\nwhitelist = %s\nexclusion_mode = "sticky"\n' "$1" "${2:-[]}" > "$3"; }
+          EOF
+
+      # ── Fixture ──────────────────────────────────────────────────────────────
+      - name: Set up fixture
+        run: |
+          REPO="$RUNNER_TEMP/core-repo"
+          CFG="$RUNNER_TEMP/core.toml"
+          mkdir -p "$REPO/.git" "$REPO/target/debug" "$REPO/target/release" "$REPO/node_modules/lodash"
+          printf 'target/\nnode_modules/\n' > "$REPO/.gitignore"
+          source "$RUNNER_TEMP/h.sh"
+          make_config "$REPO" "[]" "$CFG"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          echo "CFG=$CFG"   >> "$GITHUB_ENV"
+
+      # ── Dry-run ──────────────────────────────────────────────────────────────
+      - name: "dry-run: no xattrs set"
+        run: |
+          source "$RUNNER_TEMP/h.sh"
+          ./target/debug/letitgo --config "$CFG" --dry-run run --search-path "$REPO"
+          assert_no_xattr "$REPO/target"       "dry-run: target/"
+          assert_no_xattr "$REPO/node_modules" "dry-run: node_modules/"
+
+      # ── Real run ─────────────────────────────────────────────────────────────
+      - name: "run: exclusions applied"
+        run: |
+          source "$RUNNER_TEMP/h.sh"
+          ./target/debug/letitgo --config "$CFG" run --search-path "$REPO"
+          assert_xattr "$REPO/target"       "run: target/ excluded"
+          assert_xattr "$REPO/node_modules" "run: node_modules/ excluded"
+
+      # ── list ─────────────────────────────────────────────────────────────────
+      - name: "list: plain text"
+        run: ./target/debug/letitgo --config "$CFG" list
+
+      - name: "list --json: count >= 2"
+        run: |
+          COUNT=$(./target/debug/letitgo --config "$CFG" list --json \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
+          echo "count=$COUNT"
+          [ "$COUNT" -ge 2 ]
+
+      - name: "list --stale: none stale"
+        run: ./target/debug/letitgo --config "$CFG" list --stale
+
+      # ── clean (no-op) ───────────────────────────────────────────────────────
+      - name: "clean: no stale paths"
+        run: ./target/debug/letitgo --config "$CFG" clean
+
+      # ── Idempotent second run ────────────────────────────────────────────────
+      - name: "idempotent re-run"
+        run: |
+          source "$RUNNER_TEMP/h.sh"
+          ./target/debug/letitgo --config "$CFG" run --search-path "$REPO"
+          assert_xattr "$REPO/target" "idempotent: target/ still excluded"
+
+      # ── Reset ────────────────────────────────────────────────────────────────
+      - name: "reset: exclusions removed"
+        run: |
+          source "$RUNNER_TEMP/h.sh"
+          ./target/debug/letitgo --config "$CFG" reset --yes
+          assert_no_xattr "$REPO/target"       "reset: target/"
+          assert_no_xattr "$REPO/node_modules" "reset: node_modules/"
+
+      - name: "list after reset: empty"
+        run: ./target/debug/letitgo --config "$CFG" list
+
+      # ── Cleanup ──────────────────────────────────────────────────────────────
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f ./target/debug/letitgo ] && ./target/debug/letitgo --config "$CFG" reset --yes 2>/dev/null || true
