@@ -1,0 +1,3 @@
+[submodule "tmignore"]
+	path = tmignore
+	url = https://github.com/samuelmeuli/tmignore
