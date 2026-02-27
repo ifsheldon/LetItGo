@@ -152,9 +152,7 @@ impl Config {
                 Ok((config, true))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Config::default(), false)),
-            Err(e) => {
-                Err(e).with_context(|| format!("reading config file: {}", path.display()))
-            }
+            Err(e) => Err(e).with_context(|| format!("reading config file: {}", path.display())),
         }
     }
 
