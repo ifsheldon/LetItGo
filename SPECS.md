@@ -101,7 +101,7 @@ Commands:
 
 Global Options:
   -c, --config <PATH>   Path to config file (default: ~/.config/letitgo/config.toml)
-  -v, --verbose         Increase log verbosity (repeat for more: -vv, -vvv)
+  -v, --verbose         Increase log verbosity (-v = DEBUG, -vv = TRACE)
   -q, --quiet           Suppress non-error output
   --dry-run             Show what would be done without making changes
 ```
@@ -294,8 +294,8 @@ The `ignore` crate (by BurntSushi, the ripgrep author) provides `WalkBuilder::bu
 | `anyhow` | Error handling |
 | `directories` | XDG/macOS standard paths (`~/Library/Caches`, etc.) |
 | `chrono` | Timestamps in cache |
-| `walkdir` | Raw directory traversal for the two-pass ignore resolution |
-| `fd-lock` | Advisory file locking for `/tmp/letitgo.lock` |
+| `walkdir` | Raw directory traversal for single-pass ignore resolution |
+| `fd-lock` | Advisory file locking for `~/Library/Caches/letitgo/letitgo.lock` |
 | `owo-colors` | TTY-aware terminal colors (auto-disables when piped) |
 
 ### 5.4 Module Structure
@@ -322,14 +322,16 @@ src/
 ```
  1. Load config (TOML)
  2. Load cache (JSON via serde_json — previous exclusion set as HashSet)
- 3. Acquire lockfile (/tmp/letitgo.lock) — skip run if already held
+ 3. Acquire lockfile (~/Library/Caches/letitgo/letitgo.lock) — skip if already held.
+    Note: `clean` and `reset` also acquire the lock before mutating the cache,
+    preventing races between concurrent command invocations.
  4. Scan search_paths for Git repos:
     - Use ignore::WalkBuilder with parallel walking
-    - Filter for .git directories
+    - Filter for .git entries (both directories and files, to detect submodules)
     - Skip ignored_paths from config
     → Produces Vec<PathBuf> of repo roots
  5. For each repo (in parallel via rayon), resolve excluded paths:
-    → Two-pass algorithm (see §6.2 below)
+    → Single-pass algorithm (see §6.2 below)
  6. Merge all repos → deduplicated HashSet<PathBuf>
  7. Diff against cache:
     - paths_to_add    = new_set - cached_set
@@ -353,34 +355,43 @@ src/
 11. Log summary (# added, # removed, # total, duration)
 ```
 
-### 6.2 Per-Repo Ignore Resolution (Two-Pass Algorithm)
+### 6.2 Per-Repo Ignore Resolution (Single-Pass Algorithm)
 
 Extracting ignored paths from the `ignore` crate requires care, because
 `WalkBuilder` emits **non-ignored** entries and prunes ignored subtrees.
-We use `GitignoreBuilder` + `walkdir` instead, with a two-pass approach.
+We use `GitignoreBuilder` + `walkdir` instead, with an incremental
+single-pass approach that discovers `.gitignore` files during the walk.
 
 ```
-Pass 1 — Collect ignored directories (with pruning):
+Pass 1 — Collect ignored paths (single walk with incremental .gitignore discovery):
 
-  1. Build a Gitignore matcher from all .gitignore files in the repo
-     (root + subdirectories) using ignore::gitignore::GitignoreBuilder.
-  2. Walk the repo with walkdir::WalkDir.
-  3. For each entry, call gitignore.matched(path, is_dir):
-     - Match::Ignore + is_dir → add to excluded_dirs, call skip_current_dir()
-       (prune: don't descend into ignored directories)
-     - Match::Ignore + is_file → add to excluded_files (optional, see note)
-     - Match::None / Match::Whitelist → continue walking
+  1. Pre-load repo_root/.gitignore (if it exists) into a GitignoreBuilder
+     and build the initial Gitignore matcher.
+  2. Walk the repo with walkdir::WalkDir using a while-let loop (for
+     access to skip_current_dir()). For each entry:
+     a. Skip .git directories via skip_current_dir().
+     b. If any ancestor is already in the excluded set, skip (and
+        skip_current_dir() for directories — physical pruning).
+     c. If entry is a non-ignored directory and contains a .gitignore:
+        add it to the collection, rebuild the matcher from ALL found
+        .gitignore files. (GitignoreBuilder::build() consumes self, so
+        a fresh builder is created each time. Cost is O(N²) in .gitignore
+        count, but N < 10 for most repos — negligible vs I/O savings.)
+     d. Check entry against matcher:
+        - Match::Ignore + is_dir → add to excluded, skip_current_dir()
+        - Match::Ignore + is_file → add to excluded
+        - Match::None / Match::Whitelist → continue
 
 Pass 2 — Apply .lignore overrides (exact-match negation only):
 
-  4. Load .lignore files into a second GitignoreBuilder, with each .lignore
+  3. Load .lignore files into a second GitignoreBuilder, with each .lignore
      file rooted at the same directory as its co-located .gitignore — mirroring
      standard gitignore path scoping. A .lignore at repo-root/ has global scope
      (can reference paths produced by any subdirectory .gitignore); a .lignore
      at src/ is scoped to paths under src/.
-  5. For plain (non-negated) lines in .lignore:
+  4. For plain (non-negated) lines in .lignore:
      - Add matching paths to the exclusion set (additional exclusions).
-  6. For negation patterns (lines starting with `!`):
+  5. For negation patterns (lines starting with `!`):
      a. Resolve the negated pattern to an absolute path.
      b. If that absolute path is a DIRECT ENTRY in the exclusion set, remove
         it. E.g. `!target/` in repo-root/.lignore removes `repo-root/target/`
@@ -396,7 +407,7 @@ Pass 2 — Apply .lignore overrides (exact-match negation only):
               supported — `target/` remains fully excluded from backups.
               Workaround: use `!target/` to fully un-exclude the directory.
 
-  7. Apply whitelist from config: remove paths matching whitelist globs.
+  6. Apply whitelist from config: remove paths matching whitelist globs.
 ```
 
 > [!NOTE]
@@ -533,11 +544,11 @@ end
 
 ## 9. Edge Cases to Handle
 
-1. **Nested Git repos** (submodules) — each should be scanned independently
+1. **Nested Git repos** (submodules) — each should be scanned independently. The scanner detects `.git` entries that are either directories (regular repos) or files (submodules and worktrees use a `.git` file pointing to the actual git dir)
 2. **Symlinks** — do NOT follow them (avoid infinite loops)
 3. **Very large repos** — e.g. monorepos with thousands of ignored paths. Batch `tmutil` calls (200 paths per invocation)
 4. **Permission errors** — some dirs may not be readable. Log warning and skip
-5. **Concurrent runs** — protected by `/tmp/letitgo.lock` advisory file lock. If a second instance can't acquire the lock, it logs a warning and exits gracefully.
+5. **Concurrent runs** — all cache-mutating commands (`run`, `clean`, `reset`) acquire `~/Library/Caches/letitgo/letitgo.lock` before making changes. If a second instance can't acquire the lock, it logs a warning and exits gracefully.
 6. **Signal safety (Ctrl-C / SIGKILL)** — `flock(2)` advisory locks are per-open-file-description; the OS releases them automatically when the process exits, regardless of how it is killed (even SIGKILL, even without Rust `Drop` running). Cache writes are atomic (temp-file + `rename(2)`), so a killed process leaves no corrupt state — the previous cache file remains intact.
 7. **`tmutil` failures** — handle non-zero exit codes gracefully (e.g. exit code 213 = path not found, safe to ignore)
 8. **Mode switching** — if user switches from sticky to fixed-path (or vice versa), warn that `reset` should be run first to clean up the old exclusion type. Record the mode in the cache file for detection
@@ -591,7 +602,7 @@ redirect everything to a temp directory:
 pub struct AppContext {
     pub config_path: PathBuf,              // default: ~/.config/letitgo/config.toml
     pub cache_path: PathBuf,               // default: ~/Library/Caches/letitgo/cache.json
-    pub lock_path: PathBuf,                // default: /tmp/letitgo.lock
+    pub lock_path: PathBuf,                // default: ~/Library/Caches/letitgo/letitgo.lock
     pub exclusion_manager: Box<dyn ExclusionManager>,
 }
 ```
