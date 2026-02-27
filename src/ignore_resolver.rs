@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use path_clean::PathClean;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -252,36 +253,30 @@ fn process_lignore_file(
 
     // Apply negations
     for neg_pattern in &negation_patterns {
-        // Resolve to absolute path relative to the lignore_dir
-        let candidate = lignore_dir.join(neg_pattern.trim_end_matches('/'));
+        // Resolve to absolute path relative to the lignore_dir, cleaning any
+        // `..` or `.` components so the path matches exclusion-set entries.
+        let candidate = lignore_dir.join(neg_pattern.trim_end_matches('/')).clean();
 
         if excluded.contains(&candidate) {
             // Direct entry — remove it
             debug!("lignore negation removes: {}", candidate.display());
             excluded.remove(&candidate);
-        } else {
-            // Check if the negated path is a sub-path of an excluded directory
-            let is_sub_path = excluded.iter().any(|excl| candidate.starts_with(excl));
-            if is_sub_path {
-                // Find the parent exclusion for the warning message
-                let parent_excl = excluded
-                    .iter()
-                    .find(|excl| candidate.starts_with(excl.as_path()))
-                    .cloned();
-                if let Some(parent) = parent_excl {
-                    warn!(
-                        ".lignore negation `!{}` targets a sub-path of excluded directory `{}`. \
-                         Sub-path negation is not yet supported — `{}` remains fully excluded. \
-                         Workaround: use `!{}` to fully un-exclude the directory.",
-                        neg_pattern,
-                        parent.display(),
-                        parent.display(),
-                        parent.file_name().unwrap_or_default().to_string_lossy(),
-                    );
-                }
-            }
-            // Else: the pattern simply doesn't match anything — silently ignore
+        } else if let Some(parent) = excluded
+            .iter()
+            .find(|excl| candidate.starts_with(excl.as_path()))
+        {
+            // The negated path is a sub-path of an excluded directory
+            warn!(
+                ".lignore negation `!{}` targets a sub-path of excluded directory `{}`. \
+                 Sub-path negation is not yet supported — `{}` remains fully excluded. \
+                 Workaround: use `!{}` to fully un-exclude the directory.",
+                neg_pattern,
+                parent.display(),
+                parent.display(),
+                parent.file_name().unwrap_or_default().to_string_lossy(),
+            );
         }
+        // Else: the pattern simply doesn't match anything — silently ignore
     }
 
     Ok(())
@@ -502,6 +497,45 @@ mod tests {
         let excluded = resolve_excluded_paths(&repo, &wl).unwrap();
 
         assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn test_path_clean_resolves_dotdot() {
+        use path_clean::PathClean;
+        // Verify that path_clean::clean resolves .. and . as expected
+        assert_eq!(PathBuf::from("/a/b/../c").clean(), PathBuf::from("/a/c"));
+        assert_eq!(
+            PathBuf::from("/a/b/./c/../d").clean(),
+            PathBuf::from("/a/b/d")
+        );
+        assert_eq!(PathBuf::from("/a/b/c/..").clean(), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn test_lignore_negation_with_dotdot_component() {
+        // Verify that `!../sibling/` in a subdirectory .lignore resolves
+        // correctly against the exclusion set after path normalization.
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("test-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("target")).unwrap();
+        fs::create_dir_all(repo.join("vendor")).unwrap();
+        // Root .gitignore excludes both
+        fs::write(repo.join(".gitignore"), "target/\nvendor/\n").unwrap();
+        // A .lignore inside src/ uses `..` to negate vendor/ at the repo root
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/.lignore"), "!../vendor/\n").unwrap();
+        let wl = empty_whitelist();
+
+        let excluded = resolve_excluded_paths(&repo, &wl).unwrap();
+
+        // vendor/ should be removed by the negation (../vendor from src/ = repo/vendor)
+        assert!(
+            !excluded.contains(&repo.join("vendor")),
+            "vendor/ should have been un-excluded by src/.lignore `!../vendor/`"
+        );
+        // target/ should still be excluded
+        assert!(excluded.contains(&repo.join("target")));
     }
 
     #[cfg(unix)]
