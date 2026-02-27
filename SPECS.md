@@ -79,10 +79,11 @@ data/large-dataset/   → additionally exclude from TM (may or may not be in .gi
 
 **Why JSON:**
 
-- **Power-efficient:** Single `read()` + single `write()` per run. No WAL/journal overhead.
+- **Power-efficient:** Single `read()` + single **atomic** `rename(2)` per run. No WAL/journal overhead.
 - **Fast:** At this data size (~KB), `serde_json` is more than sufficient.
 - **Simple:** No SQLite dependency. Easy to inspect and debug manually. Works on all architectures with zero config.
 - **Deduplication:** Done in-memory with a `HashSet` before writing.
+- **Crash-safe:** The write is atomic — serialised to a `NamedTempFile` in the same directory, then renamed into place. A process killed mid-write (Ctrl-C, SIGKILL, power loss) leaves the previous cache file intact; the partially-written temp file is cleaned up by the OS.
 
 ---
 
@@ -305,7 +306,7 @@ src/
 ├── cli.rs            # Clap command/arg definitions
 ├── config.rs         # TOML config file parsing
 ├── scanner.rs        # Repo discovery (parallel walk, find .git dirs)
-├── ignore.rs         # .gitignore + .lignore resolution, override logic
+├── ignore_resolver.rs # .gitignore + .lignore resolution, override logic
 ├── tmutil.rs         # tmutil command wrapper (add/remove exclusion)
 ├── cache.rs          # JSON cache read/write/diff
 ├── clean.rs          # Path validation & stale cleanup
@@ -342,8 +343,13 @@ src/
     In practice the diff is usually small (a handful of paths), so most runs
     produce only 1–2 tmutil invocations total. The initial run on a fresh machine
     may have thousands of paths, making chunking important.
- 9. Update cache file with new_set + timestamp + exclusion_mode
-10. Release lockfile
+ 9. Write cache atomically: serialise new_set + timestamp + exclusion_mode to a
+    sibling NamedTempFile, then rename(2) it into place. The advisory lock is
+    held during this step. If the process is killed at any point, the previous
+    cache file remains intact (rename is atomic on POSIX; the temp file is
+    reclaimed by the OS).
+10. Release lockfile (or: lock is released automatically by the OS when the
+    process exits — flock(2) is per-open-file-description, not per-process).
 11. Log summary (# added, # removed, # total, duration)
 ```
 
@@ -532,10 +538,11 @@ end
 3. **Very large repos** — e.g. monorepos with thousands of ignored paths. Batch `tmutil` calls (200 paths per invocation)
 4. **Permission errors** — some dirs may not be readable. Log warning and skip
 5. **Concurrent runs** — protected by `/tmp/letitgo.lock` advisory file lock. If a second instance can't acquire the lock, it logs a warning and exits gracefully.
-6. **`tmutil` failures** — handle non-zero exit codes gracefully (e.g. exit code 213 = path not found, safe to ignore)
-7. **Mode switching** — if user switches from sticky to fixed-path (or vice versa), warn that `reset` should be run first to clean up the old exclusion type. Record the mode in the cache file for detection
-8. **Empty `.lignore`** — if present but empty, it has no effect (neither adds nor negates)
-9. **Global `.gitignore`** — the `ignore` crate respects `core.excludesfile` from Git config automatically
+6. **Signal safety (Ctrl-C / SIGKILL)** — `flock(2)` advisory locks are per-open-file-description; the OS releases them automatically when the process exits, regardless of how it is killed (even SIGKILL, even without Rust `Drop` running). Cache writes are atomic (temp-file + `rename(2)`), so a killed process leaves no corrupt state — the previous cache file remains intact.
+7. **`tmutil` failures** — handle non-zero exit codes gracefully (e.g. exit code 213 = path not found, safe to ignore)
+8. **Mode switching** — if user switches from sticky to fixed-path (or vice versa), warn that `reset` should be run first to clean up the old exclusion type. Record the mode in the cache file for detection
+9. **Empty `.lignore`** — if present but empty, it has no effect (neither adds nor negates)
+10. **Global `.gitignore`** — the `ignore` crate respects `core.excludesfile` from Git config automatically
 
 ---
 
@@ -646,20 +653,27 @@ fn create_test_repo_with_lignore(root: &Path) -> PathBuf {
 
 **Unit tests:**
 
-- Config: parse valid TOML, missing fields use defaults, invalid TOML returns error
-- Cache: round-trip read/write, diff computation (added/removed sets), empty cache
-- Ignore resolution: `.gitignore` patterns match correctly, `.lignore` additions/negations work, whitelist filters paths, sub-path negation emits warning
+- Config: parse valid TOML, missing fields use defaults, invalid TOML returns error, `expand_tilde`, `is_fixed_path`, resolved search paths
+- Cache: round-trip read/write (atomic via rename), diff computation (added/removed/identical sets), empty cache, nested parent-dir creation
+- Error: `is_tmutil_safe_error` distinguishes code 213 from all others
+- Scanner: basic repo discovery, ignored-path filtering, nested submodules, multiple search paths, symlinks not followed, missing search path
+- Ignore resolution: `.gitignore` directory-level and file-level patterns, nested `.gitignore` and `.lignore` scoped to subdirectory, `.lignore` additions/negations, whitelist filtering, sub-path negation warning, repo with no `.gitignore`, symlinks not followed inside repo, `.git` dir not in exclusion set
 
-**Integration tests:**
+**Integration tests** (all use `MockExclusionManager` + temp dirs; zero system impact):
 
-- `run` on a fresh repo: mock receives correct `add_exclusions` calls, cache file is written
-- `run` on a repo with existing cache: only diff is sent to mock (new paths added, stale paths removed)
-- `run` with `.lignore` negation: negated paths are NOT in mock's `added` list
-- `clean` with stale paths: mock receives `remove_exclusions`, cache is updated
-- `reset`: mock receives `remove_exclusions` for ALL cached paths, cache is deleted
-- `list`: reads cache and prints paths (no mock interaction)
-- `init`: creates config file with comments, `--force` overwrites
-- Lockfile: concurrent run attempt exits gracefully
+- `run`: fresh repo — `add_exclusions` called with correct paths, cache written
+- `run`: incremental — only diff sent (new paths added, removed paths un-excluded), verified via both cache and mock call inspection
+- `run`: `.lignore` negation — negated paths absent from mock's `add_exclusions` calls
+- `run`: `--dry-run` — cache not written, `ExclusionManager` never called
+- `run`: `--search-path` override supersedes config paths
+- `run`: mode-switch (sticky → fixed-path) — emits warning, does not crash
+- `run`: repo with no `.gitignore` — no exclusions added
+- `run`: config whitelist — whitelisted paths excluded from `add_exclusions` even when in `.gitignore`
+- `list`: empty cache, with live + stale paths, `--json`, `--stale` (all variants — no crash, correct output)
+- `clean`: stale paths removed from cache and un-excluded; `--dry-run` leaves cache unchanged
+- `reset`: cache deleted and exclusions removed; empty cache handled gracefully; `--dry-run` leaves cache unchanged and skips `remove_exclusions`
+- `init`: creates config with nested dirs, `--force` overwrites, no-overwrite by default
+- Lockfile: concurrent run attempt (lock manually held) exits gracefully without writing cache
 
 **Smoke tests (manual, opt-in):**
 
