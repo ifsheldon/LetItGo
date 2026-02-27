@@ -46,7 +46,7 @@ pub const BACKUP_EXCLUDE_XATTR_VALUE: &[u8] = &[
 /// spawning `tmutil` subprocesses. This is much faster (pure syscall, no
 /// process overhead) and avoids the timeout issues seen with `tmutil`.
 /// Set to `false` to fall back to the old `tmutil`-based code path.
-const ADD_XATTR_DIRECTLY: bool = true;
+const UPDATE_XATTR_DIRECTLY: bool = true;
 
 /// Abstraction over Time Machine exclusion operations.
 ///
@@ -123,7 +123,7 @@ impl ExclusionManager for TmutilManager {
                 );
             }
 
-            if ADD_XATTR_DIRECTLY {
+            if UPDATE_XATTR_DIRECTLY {
                 return set_backup_exclusion_xattr(&filtered);
             }
             return run_tmutil_batched("addexclusion", &filtered, false);
@@ -133,7 +133,7 @@ impl ExclusionManager for TmutilManager {
     }
 
     fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
-        if ADD_XATTR_DIRECTLY && !fixed_path {
+        if UPDATE_XATTR_DIRECTLY && !fixed_path {
             return remove_backup_exclusion_xattr(paths);
         }
         run_tmutil_batched("removeexclusion", paths, fixed_path)
