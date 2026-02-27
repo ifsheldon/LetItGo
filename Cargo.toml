@@ -2,5 +2,57 @@
 name = "letitgo"
 version = "0.1.0"
 edition = "2024"
+description = "Exclude gitignored files from Time Machine backups"
+license = "Apache-2.0"
+repository = "https://github.com/ifsheldon/LetItGo"
+
+[[bin]]
+name = "letitgo"
+path = "src/main.rs"
 
 [dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Ignore / gitignore parsing + parallel walk
+ignore = "0.4"
+walkdir = "2"
+
+# Parallelism
+rayon = "1"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "1.0"
+
+# Cache
+serde_json = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Standard paths (~/Library/Caches, etc.)
+directories = "6"
+
+# File locking
+fd-lock = "4"
+
+# Terminal colors (TTY-aware)
+owo-colors = "4"
+
+# Glob matching (for whitelist)
+globset = "0.4"
+
+# Temp files (used for atomic cache writes)
+tempfile = "3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
