@@ -386,7 +386,7 @@ runs as root.
 # Build
 cargo build
 
-# Run all tests (62 tests, all using mock tmutil — zero system impact)
+# Run all tests (67 tests, all using mock tmutil — zero system impact)
 cargo test
 
 # Lint
@@ -401,7 +401,7 @@ are deleted automatically on test completion.
 The [CI workflow](.github/workflows/ci.yml) runs everything on `macos-latest` (free for public repos):
 
 - **Lint**: `cargo fmt --check` + `cargo clippy`
-- **Unit + integration tests**: all 62 tests with mock (zero system impact)
+- **Unit + integration tests**: all 67 tests with mock (zero system impact)
 - **Real tmutil smoke test**: `addexclusion` → `isexcluded` → `removeexclusion` against actual `tmutil`
 
 ---

@@ -297,6 +297,9 @@ The `ignore` crate (by BurntSushi, the ripgrep author) provides `WalkBuilder::bu
 | `walkdir` | Raw directory traversal for single-pass ignore resolution |
 | `fd-lock` | Advisory file locking for `~/Library/Caches/letitgo/letitgo.lock` |
 | `owo-colors` | TTY-aware terminal colors (auto-disables when piped) |
+| `globset` | Glob matching for whitelist patterns |
+| `path-clean` | Lexical path normalization (resolve `..` components without I/O) |
+| `tempfile` | Temp files for atomic cache writes |
 
 ### 5.4 Module Structure
 
@@ -350,10 +353,11 @@ src/
     idempotent — the next run recomputes the full diff and retries everything.
     Paths that were successfully processed become harmless no-ops on retry.
  9. Write cache atomically (only on success of step 8): serialise new_set +
-    timestamp + exclusion_mode to a sibling NamedTempFile, then rename(2) it
-    into place. The advisory lock is held during this step. If the process is
-    killed at any point, the previous cache file remains intact (rename is
-    atomic on POSIX; the temp file is reclaimed by the OS).
+    timestamp + exclusion_mode to a sibling NamedTempFile, fsync the temp
+    file to flush data to stable storage, then rename(2) it into place.
+    The advisory lock is held during this step. If the process is killed at
+    any point, the previous cache file remains intact (rename is atomic on
+    POSIX; the temp file is reclaimed by the OS).
 10. Release lockfile (or: lock is released automatically by the OS when the
     process exits — flock(2) is per-open-file-description, not per-process).
 11. Log summary (# added, # removed, # total, duration)
@@ -401,7 +405,8 @@ Pass 2 — Apply .lignore overrides (exact-match negation only):
        .git and already-excluded subtrees for efficiency.
      - Add matching paths to the exclusion set (additional exclusions).
   5. For negation patterns (lines starting with `!`):
-     a. Resolve the negated pattern to an absolute path.
+     a. Resolve the negated pattern to an absolute path and normalize it
+        lexically (via `path-clean`) to collapse `..` components.
      b. If that absolute path is a DIRECT ENTRY in the exclusion set, remove
         it. E.g. `!target/` in repo-root/.lignore removes `repo-root/target/`
         from the set. This works regardless of which .gitignore file (root-
@@ -560,7 +565,7 @@ end
 5. **Concurrent runs** — all cache-mutating commands (`run`, `clean`, `reset`) acquire `~/Library/Caches/letitgo/letitgo.lock` before making changes. If a second instance can't acquire the lock, it logs a warning and exits gracefully.
 6. **Signal safety (Ctrl-C / SIGKILL)** — `flock(2)` advisory locks are per-open-file-description; the OS releases them automatically when the process exits, regardless of how it is killed (even SIGKILL, even without Rust `Drop` running). Cache writes are atomic (temp-file + `rename(2)`), so a killed process leaves no corrupt state — the previous cache file remains intact.
 7. **`tmutil` failures** — handle non-zero exit codes gracefully (e.g. exit code 213 = path not found, safe to ignore)
-8. **Mode switching** — if user switches from sticky to fixed-path (or vice versa), warn that `reset` should be run first to clean up the old exclusion type. Record the mode in the cache file for detection
+8. **Mode switching** — if the cached exclusion mode differs from the configured mode and the cache is non-empty, `letitgo run` blocks and prompts the user to reset (removing old exclusions using the **old** mode's flag). In dry-run mode it logs and returns early; in non-interactive contexts (no TTY) it skips gracefully. The mode is recorded in the cache file for detection
 9. **Empty `.lignore`** — if present but empty, it has no effect (neither adds nor negates)
 10. **Global `.gitignore`** — the `ignore` crate respects `core.excludesfile` from Git config automatically
 
