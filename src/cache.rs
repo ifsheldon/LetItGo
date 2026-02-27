@@ -88,15 +88,16 @@ pub fn write_cache(path: &Path, cache: &Cache) -> Result<()> {
 
 /// Compute the diff between two path sets.
 ///
-/// Returns `(to_add, to_remove)` where:
+/// Returns borrowed `&Path` references into the input sets — no cloning.
+///
 /// - `to_add`    = paths in `new_set` but not in `old_set`
 /// - `to_remove` = paths in `old_set` but not in `new_set`
-pub fn diff_sets(
-    old_set: &HashSet<PathBuf>,
-    new_set: &HashSet<PathBuf>,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let to_add: Vec<PathBuf> = new_set.difference(old_set).cloned().collect();
-    let to_remove: Vec<PathBuf> = old_set.difference(new_set).cloned().collect();
+pub fn diff_sets<'a>(
+    old_set: &'a HashSet<PathBuf>,
+    new_set: &'a HashSet<PathBuf>,
+) -> (Vec<&'a Path>, Vec<&'a Path>) {
+    let to_add: Vec<&Path> = new_set.difference(old_set).map(|p| p.as_path()).collect();
+    let to_remove: Vec<&Path> = old_set.difference(new_set).map(|p| p.as_path()).collect();
     (to_add, to_remove)
 }
 
@@ -145,8 +146,8 @@ mod tests {
         let new: HashSet<PathBuf> = [pb("/b"), pb("/c"), pb("/d")].into_iter().collect();
 
         let (to_add, to_remove) = diff_sets(&old, &new);
-        assert_eq!(to_add, vec![pb("/d")]);
-        assert_eq!(to_remove, vec![pb("/a")]);
+        assert_eq!(to_add, vec![Path::new("/d")]);
+        assert_eq!(to_remove, vec![Path::new("/a")]);
     }
 
     #[test]
@@ -157,7 +158,7 @@ mod tests {
         let (to_add, to_remove) = diff_sets(&old, &new);
         let mut sorted = to_add.clone();
         sorted.sort();
-        assert_eq!(sorted, vec![pb("/x"), pb("/y")]);
+        assert_eq!(sorted, vec![Path::new("/x"), Path::new("/y")]);
         assert!(to_remove.is_empty());
     }
 

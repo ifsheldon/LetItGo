@@ -220,10 +220,11 @@ fn cmd_run(
 
     // 4) Diff
     let (to_add, to_remove) = diff_sets(&old_set, &new_set);
+    let add_count = to_add.len();
+    let remove_count = to_remove.len();
     debug!(
         "{} path(s) to add, {} path(s) to remove",
-        to_add.len(),
-        to_remove.len()
+        add_count, remove_count
     );
 
     // 5) Apply exclusions
@@ -250,6 +251,10 @@ fn cmd_run(
         add_res?;
         remove_res?;
 
+        // Release borrows on old_set/new_set so we can consume new_set.
+        drop(to_add);
+        drop(to_remove);
+
         // 6) Write updated cache
         let new_cache = Cache {
             version: 1,
@@ -264,8 +269,8 @@ fn cmd_run(
     info!(
         "Done in {:.2}s — added {}, removed {}",
         elapsed.as_secs_f64(),
-        to_add.len(),
-        to_remove.len(),
+        add_count,
+        remove_count,
     );
 
     Ok(())
@@ -402,8 +407,9 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
             info!("[dry-run] would remove exclusion: {}", p.display());
         }
     } else {
+        let path_refs: Vec<&Path> = cache.paths.iter().map(|p| p.as_path()).collect();
         ctx.exclusion_manager
-            .remove_exclusions(&cache.paths, fixed_path)?;
+            .remove_exclusions(&path_refs, fixed_path)?;
         // Delete the cache file
         if ctx.cache_path.exists() {
             fs::remove_file(&ctx.cache_path)

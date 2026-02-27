@@ -28,7 +28,8 @@ pub fn clean_stale(
     }
 
     if !dry_run {
-        exclusion_manager.remove_exclusions(&stale, fixed_path)?;
+        let stale_refs: Vec<&Path> = stale.iter().map(|p| p.as_path()).collect();
+        exclusion_manager.remove_exclusions(&stale_refs, fixed_path)?;
         cache.paths = live;
         cache::write_cache(cache_path, &cache)?;
     }

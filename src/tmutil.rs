@@ -1,8 +1,5 @@
 use anyhow::{Context, Result};
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{path::Path, process::Command};
 use tracing::{debug, warn};
 
 use crate::error::is_tmutil_safe_error;
@@ -19,13 +16,13 @@ pub trait ExclusionManager: Send + Sync {
     /// When `fixed_path` is `true`, passes the `-p` flag to `tmutil`, which
     /// registers the paths in the system plist instead of setting xattrs.
     /// Paths are processed in chunks of 200 to stay within `ARG_MAX`.
-    fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
+    fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()>;
 
     /// Remove Time Machine exclusions for each path in `paths`.
     ///
     /// Mirrors [`add_exclusions`](Self::add_exclusions) — `fixed_path` must
     /// match the mode that was used when the exclusion was originally added.
-    fn remove_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
+    fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()>;
 
     /// Return `true` if `path` is currently excluded from Time Machine backups.
     ///
@@ -39,10 +36,10 @@ pub trait ExclusionManager: Send + Sync {
 /// satisfying the `Box<dyn ExclusionManager>` requirement on `AppContext`.
 #[cfg(test)]
 impl<T: ExclusionManager> ExclusionManager for std::sync::Arc<T> {
-    fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
+    fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
         self.as_ref().add_exclusions(paths, fixed_path)
     }
-    fn remove_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
+    fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
         self.as_ref().remove_exclusions(paths, fixed_path)
     }
     fn is_excluded(&self, path: &Path) -> Result<bool> {
@@ -56,7 +53,7 @@ impl<T: ExclusionManager> ExclusionManager for std::sync::Arc<T> {
 pub struct TmutilManager;
 
 impl ExclusionManager for TmutilManager {
-    fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
+    fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -66,7 +63,7 @@ impl ExclusionManager for TmutilManager {
         Ok(())
     }
 
-    fn remove_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
+    fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -93,7 +90,7 @@ impl ExclusionManager for TmutilManager {
 /// Exit code 213 (path not found) is treated as non-fatal and logged as a
 /// warning; any other non-zero exit code returns an error.  The `-p` flag is
 /// included only when `fixed_path` is `true`.
-fn run_tmutil(verb: &str, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
+fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
     let mut cmd = Command::new("/usr/bin/tmutil");
     cmd.arg(verb);
     if fixed_path {
@@ -141,6 +138,7 @@ fn run_tmutil(verb: &str, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
 #[cfg(test)]
 pub mod mock {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// Records calls in-memory; never touches the system.
@@ -168,13 +166,19 @@ pub mod mock {
     }
 
     impl ExclusionManager for MockExclusionManager {
-        fn add_exclusions(&self, paths: &[PathBuf], _fixed_path: bool) -> Result<()> {
-            self.added.lock().unwrap().extend_from_slice(paths);
+        fn add_exclusions(&self, paths: &[&Path], _fixed_path: bool) -> Result<()> {
+            self.added
+                .lock()
+                .unwrap()
+                .extend(paths.iter().map(|p| p.to_path_buf()));
             Ok(())
         }
 
-        fn remove_exclusions(&self, paths: &[PathBuf], _fixed_path: bool) -> Result<()> {
-            self.removed.lock().unwrap().extend_from_slice(paths);
+        fn remove_exclusions(&self, paths: &[&Path], _fixed_path: bool) -> Result<()> {
+            self.removed
+                .lock()
+                .unwrap()
+                .extend(paths.iter().map(|p| p.to_path_buf()));
             Ok(())
         }
 
