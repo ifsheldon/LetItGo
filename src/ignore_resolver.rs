@@ -131,12 +131,30 @@ fn build_gitignore_from_files(repo_root: &Path, files: &[PathBuf]) -> Result<Git
 /// - Plain patterns → add to exclusion set
 /// - Negated patterns (`!pattern`) → remove from exclusion set (exact match only)
 fn apply_lignore_overrides(repo_root: &Path, excluded: &mut HashSet<PathBuf>) -> Result<()> {
-    // Find all .lignore files
-    for entry in WalkDir::new(repo_root)
+    // Find all .lignore files, skipping .git and already-excluded directories.
+    let mut walker = WalkDir::new(repo_root)
         .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+        .into_iter();
+
+    while let Some(entry_result) = walker.next() {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Walk error discovering .lignore files: {}", e);
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        let is_dir = entry.file_type().is_dir();
+
+        if is_dir {
+            if path.file_name().is_some_and(|n| n == ".git") || excluded.contains(path) {
+                walker.skip_current_dir();
+                continue;
+            }
+        }
+
         if entry.file_type().is_file() && entry.file_name() == ".lignore" {
             let lignore_path = entry.path();
             let lignore_dir = match lignore_path.parent() {
@@ -200,15 +218,29 @@ fn process_lignore_file(
 
     // Apply additions
     let addition_matcher = addition_builder.build()?;
-    // Walk lignore_dir to find newly matched paths
-    for entry in WalkDir::new(lignore_dir)
+    // Walk lignore_dir to find newly matched paths, skipping .git and excluded dirs.
+    let mut add_walker = WalkDir::new(lignore_dir)
         .follow_links(false)
         .min_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+        .into_iter();
+
+    while let Some(entry_result) = add_walker.next() {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Walk error in .lignore addition scan: {}", e);
+                continue;
+            }
+        };
+
         let path = entry.path();
         let is_dir = entry.file_type().is_dir();
+
+        if is_dir && (path.file_name().is_some_and(|n| n == ".git") || excluded.contains(path)) {
+            add_walker.skip_current_dir();
+            continue;
+        }
+
         let rel = match path.strip_prefix(lignore_dir) {
             Ok(r) => r,
             Err(_) => continue,
@@ -216,6 +248,9 @@ fn process_lignore_file(
         if let ignore::Match::Ignore(_) = addition_matcher.matched(rel, is_dir) {
             debug!("lignore addition: {}", path.display());
             excluded.insert(path.to_path_buf());
+            if is_dir {
+                add_walker.skip_current_dir();
+            }
         }
     }
 
