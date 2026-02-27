@@ -247,12 +247,8 @@ fn cmd_run(
             (add_res, remove_res)
         });
 
-        if let Err(e) = add_res {
-            warn!("Error adding exclusions: {}", e);
-        }
-        if let Err(e) = remove_res {
-            warn!("Error removing exclusions: {}", e);
-        }
+        add_res?;
+        remove_res?;
 
         // 6) Write updated cache
         let new_cache = Cache {
@@ -363,9 +359,10 @@ fn cmd_list(ctx: &AppContext, json: bool, stale_only: bool) -> Result<()> {
 /// Prompts for confirmation unless `yes` is `true`.
 /// When `dry_run` is `true`, prints what would be removed but makes no changes.
 fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Result<()> {
-    let cache = load_cache(&ctx.cache_path)?;
+    // Pre-load to show the count in the confirmation prompt.
+    let preview_cache = load_cache(&ctx.cache_path)?;
 
-    if cache.paths.is_empty() {
+    if preview_cache.paths.is_empty() {
         info!("Nothing to reset — cache is empty.");
         return Ok(());
     }
@@ -373,7 +370,7 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
     if !yes {
         eprint!(
             "This will remove {} exclusion(s). Continue? [y/N] ",
-            cache.paths.len()
+            preview_cache.paths.len()
         );
         io::stderr().flush()?;
         let mut input = String::new();
@@ -390,6 +387,13 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
         warn!("Another letitgo instance is running. Skipping.");
         return Ok(());
     };
+
+    // Re-load cache under lock to avoid TOCTOU race with concurrent runs.
+    let cache = load_cache(&ctx.cache_path)?;
+    if cache.paths.is_empty() {
+        info!("Nothing to reset — cache is empty.");
+        return Ok(());
+    }
 
     let fixed_path = config.exclusion_mode.is_fixed_path();
 
