@@ -9,12 +9,15 @@ use tracing::{debug, info, warn};
 
 use crate::error::is_tmutil_safe_error;
 
+/// The extended attribute that `tmutil addexclusion` sets in "sticky" mode.
+/// Checking for this xattr lets us skip redundant `tmutil` calls for paths
+/// that are already excluded.
+pub const BACKUP_EXCLUDE_XATTR: &str = "com.apple.metadata:com_apple_backup_excludeItem";
+
 /// Maximum number of paths per `tmutil` subprocess invocation.
 ///
-/// Kept small so that a single hanging path (e.g. on an unresponsive FUSE/
-/// network mount) doesn't stall all remaining work.  10 paths × ~100 bytes
-/// each is well within `ARG_MAX`.
-const TMUTIL_BATCH_SIZE: usize = 10;
+/// Seems unbatches ones is faster.
+const TMUTIL_BATCH_SIZE: usize = 1;
 
 /// How long to wait for a batched `tmutil` subprocess before killing it.
 /// Setting xattrs is near-instant; if tmutil takes longer than this the
@@ -23,6 +26,27 @@ const TMUTIL_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Shorter timeout used when retrying a single path after a batch timeout.
 const TMUTIL_SINGLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The value that `tmutil addexclusion` writes into the backup-exclusion xattr.
+/// This is a binary plist encoding of the string "com.apple.backupd", exactly
+/// matching what `tmutil` produces (verified via `xattr -px` on a real file).
+pub const BACKUP_EXCLUDE_XATTR_VALUE: &[u8] = &[
+    0x62, 0x70, 0x6C, 0x69, 0x73, 0x74, 0x30, 0x30, // bplist00
+    0x5F, 0x10, 0x11, // string type, length 17
+    0x63, 0x6F, 0x6D, 0x2E, 0x61, 0x70, 0x70, 0x6C, // com.appl
+    0x65, 0x2E, 0x62, 0x61, 0x63, 0x6B, 0x75, 0x70, // e.backup
+    0x64, // d
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // plist offset table
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // & trailer
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1C,
+];
+
+/// When `true`, set/remove the backup-exclusion xattr directly instead of
+/// spawning `tmutil` subprocesses. This is much faster (pure syscall, no
+/// process overhead) and avoids the timeout issues seen with `tmutil`.
+/// Set to `false` to fall back to the old `tmutil`-based code path.
+const ADD_XATTR_DIRECTLY: bool = true;
 
 /// Abstraction over Time Machine exclusion operations.
 ///
@@ -73,10 +97,45 @@ pub struct TmutilManager;
 
 impl ExclusionManager for TmutilManager {
     fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
+        // In sticky mode (the default), tmutil sets an xattr on each path.
+        if !fixed_path {
+            // Skip paths that already carry the exclusion xattr.
+            let mut already = 0usize;
+            let filtered: Vec<&Path> = paths
+                .iter()
+                .copied()
+                .filter(|p| {
+                    if has_backup_exclusion(p) {
+                        debug!("Already excluded, skipping: {}", p.display());
+                        already += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            if already > 0 {
+                info!(
+                    "Skipped {} already-excluded path(s) ({} remaining)",
+                    already,
+                    filtered.len()
+                );
+            }
+
+            if ADD_XATTR_DIRECTLY {
+                return set_backup_exclusion_xattr(&filtered);
+            }
+            return run_tmutil_batched("addexclusion", &filtered, false);
+        }
+
         run_tmutil_batched("addexclusion", paths, fixed_path)
     }
 
     fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
+        if ADD_XATTR_DIRECTLY && !fixed_path {
+            return remove_backup_exclusion_xattr(paths);
+        }
         run_tmutil_batched("removeexclusion", paths, fixed_path)
     }
 
@@ -90,6 +149,60 @@ impl ExclusionManager for TmutilManager {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(stdout.contains("[Excluded]"))
     }
+}
+
+/// Check whether `path` already carries the Time Machine backup-exclusion xattr.
+///
+/// This is a lightweight syscall (no subprocess spawned) that lets us skip
+/// redundant `tmutil addexclusion` calls for paths that are already excluded.
+/// Returns `false` on any error (e.g. path no longer exists) so we fall
+/// through to tmutil which will handle the error appropriately.
+fn has_backup_exclusion(path: &Path) -> bool {
+    xattr::get(path, BACKUP_EXCLUDE_XATTR)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Set the backup-exclusion xattr directly on each path (no tmutil subprocess).
+fn set_backup_exclusion_xattr(paths: &[&Path]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    info!("Setting exclusion xattr on {} path(s)", paths.len());
+    let mut failed = 0usize;
+    for path in paths {
+        if let Err(e) = xattr::set(path, BACKUP_EXCLUDE_XATTR, BACKUP_EXCLUDE_XATTR_VALUE) {
+            warn!("Failed to set xattr on {}: {}", path.display(), e);
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        warn!("{} path(s) failed when setting exclusion xattr", failed);
+    }
+    Ok(())
+}
+
+/// Remove the backup-exclusion xattr directly from each path (no tmutil subprocess).
+fn remove_backup_exclusion_xattr(paths: &[&Path]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    info!("Removing exclusion xattr from {} path(s)", paths.len());
+    let mut failed = 0usize;
+    for path in paths {
+        if let Err(e) = xattr::remove(path, BACKUP_EXCLUDE_XATTR) {
+            // ENOATTR (93) is fine — the xattr was already absent.
+            if e.raw_os_error() != Some(93) {
+                warn!("Failed to remove xattr from {}: {}", path.display(), e);
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        warn!("{} path(s) failed when removing exclusion xattr", failed);
+    }
+    Ok(())
 }
 
 /// Process `paths` through `tmutil <verb>` in small batches with progress
