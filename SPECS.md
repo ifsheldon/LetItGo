@@ -303,17 +303,26 @@ The `ignore` crate (by BurntSushi, the ripgrep author) provides `WalkBuilder::bu
 
 ### 5.4 Module Structure
 
+The crate uses a lib+bin split: `src/lib.rs` exposes all core modules and command
+functions as a library, while `src/main.rs` is a thin CLI wrapper that parses args
+and calls into the library. Integration and smoke tests live in `tests/` (the
+idiomatic Rust location for external test crates that import the library).
+
 ```
 src/
-├── main.rs           # Entry point, CLI dispatch
-├── cli.rs            # Clap command/arg definitions
-├── config.rs         # TOML config file parsing
-├── scanner.rs        # Repo discovery (parallel walk, find .git dirs)
+├── lib.rs             # Library root: pub modules, AppContext, command functions
+├── main.rs            # Thin CLI wrapper: arg parsing + tracing setup
+├── cli.rs             # Clap command/arg definitions
+├── config.rs          # TOML config file parsing
+├── scanner.rs         # Repo discovery (parallel walk, find .git dirs)
 ├── ignore_resolver.rs # .gitignore + .lignore resolution, override logic
-├── tmutil.rs         # tmutil command wrapper (add/remove exclusion)
-├── cache.rs          # JSON cache read/write/diff
-├── clean.rs          # Path validation & stale cleanup
-└── error.rs          # Error types
+├── tmutil.rs          # tmutil command wrapper (add/remove exclusion) + mock
+├── cache.rs           # JSON cache read/write/diff
+├── clean.rs           # Path validation & stale cleanup
+└── error.rs           # Error types
+tests/
+├── integration.rs     # 26 integration tests (MockExclusionManager, temp dirs)
+└── smoke.rs           # 21 #[ignore] smoke tests (real tmutil, macOS only)
 ```
 
 ---
@@ -644,9 +653,9 @@ fn test_run_excludes_gitignored_dirs() {
 
 | Level | What it tests | System impact | Runs in CI? |
 |---|---|---|---|
-| **Unit tests** | Config parsing, cache read/write/diff, ignore resolution, CLI args | **None** — temp dirs only | ✅ |
-| **Integration tests** | Full `run`/`clean`/`reset`/`list` flow with mock tmutil | **None** — mock + temp dirs | ✅ |
-| **Smoke tests** (manual) | Actually calls `tmutil` on temp files, verifies xattr, cleans up | **Temporary** — cleanup in test | Manual only |
+| **Unit tests** (`src/`) | Config parsing, cache read/write/diff, ignore resolution, scanner | **None** — temp dirs only | ✅ |
+| **Integration tests** (`tests/integration.rs`) | Full `run`/`clean`/`reset`/`list` flow with mock tmutil | **None** — mock + temp dirs | ✅ |
+| **Smoke tests** (`tests/smoke.rs`, `#[ignore]`) | Calls real `tmutil` on temp files, verifies xattrs, cleans up | **Temporary** — cleanup in test | ✅ (macOS CI) |
 
 ### 10.4 Test Fixtures: Fake Git Repos
 
@@ -700,9 +709,11 @@ fn create_test_repo_with_lignore(root: &Path) -> PathBuf {
 - `init`: creates config with nested dirs, `--force` overwrites, no-overwrite by default
 - Lockfile: concurrent run attempt (lock manually held) exits gracefully without writing cache
 
-**Smoke tests (manual, opt-in):**
+**Smoke tests** (`tests/smoke.rs`, `#[ignore]`, gated by `LETITGO_SMOKE=1`):
 
-- Create temp dir, call real `tmutil addexclusion`, verify xattr is set, call `tmutil removeexclusion`, verify xattr is removed
+- Core: dry-run no xattrs, run sets xattrs, list/clean/idempotent-rerun/reset
+- .lignore: negation, addition, combined, nested, whitelist (single + multi)
+- Advanced: incremental diff, stale cleanup, multi-repo, nested gitignore, file-level patterns, init, submodules, full cycle (run→reset→re-run), pattern removal
 
 ### 10.6 Test Crates
 

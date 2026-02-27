@@ -386,23 +386,28 @@ runs as root.
 # Build
 cargo build
 
-# Run all tests (67 tests, all using mock tmutil — zero system impact)
+# Run all tests (52 unit + integration tests, all using mock tmutil — zero system impact)
 cargo test
+
+# Run smoke tests (macOS only, calls real tmutil)
+LETITGO_SMOKE=1 cargo test -- --ignored --test-threads=1
 
 # Lint
 cargo clippy --all-features
 cargo fmt --check
 ```
 
-The test suite uses a `MockExclusionManager` for all tests — no real `tmutil` calls
-are made, no xattrs are set, and all file I/O is isolated to temp directories that
-are deleted automatically on test completion.
+Unit tests live alongside their modules in `src/`. Integration and smoke tests live
+in `tests/` (the idiomatic Rust location for external test crates):
+
+- `tests/integration.rs` — 26 tests using `MockExclusionManager`, zero system impact
+- `tests/smoke.rs` — 21 `#[ignore]` tests calling real `tmutil`, verifying xattrs
 
 The CI workflows run on `macos-latest` (free for public repos):
 
 | Workflow | What it tests |
 |----------|--------------|
-| [`ci.yml`](.github/workflows/ci.yml) | Lint (`fmt` + `clippy`) and all 67 unit/integration tests (mock) |
+| [`ci.yml`](.github/workflows/ci.yml) | Lint (`fmt` + `clippy`) and all 52 unit/integration tests (mock) |
 | [`smoke-core.yml`](.github/workflows/smoke-core.yml) | Real `tmutil`: dry-run, run, list, clean, idempotent re-run, reset |
 | [`smoke-lignore.yml`](.github/workflows/smoke-lignore.yml) | Real `tmutil`: `.lignore` negation/addition, nested `.lignore`, whitelist |
 | [`smoke-advanced.yml`](.github/workflows/smoke-advanced.yml) | Real `tmutil`: incremental diff, stale cleanup, multi-repo, nested `.gitignore`, file-level patterns, `init`, submodules, full cycle, pattern removal |
