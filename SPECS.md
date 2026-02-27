@@ -1,0 +1,579 @@
+# `letitgo` — Spec (v0.3)
+
+> A Rust CLI tool to keep Time Machine backups lean by automatically excluding paths matched by `.gitignore` and `.lignore` files.
+
+---
+
+## 1. Overview
+
+`letitgo` scans configured directories for Git repositories, resolves ignored paths via `.gitignore` (and optional `.lignore` override files), and tells Time Machine to exclude them. It can run as a one-shot command or as a periodic `launchd`/`brew services` service.
+
+**Key design decisions:**
+
+- **Synchronous Rust** — the `ignore` crate's built-in `crossbeam` thread pool handles parallel directory walking; `rayon` provides additional parallelism where useful
+- **JSON cache** via `serde_json` — power-efficient, simple, broadest CPU compatibility
+- **`.lignore` override** using Union + Negate semantics
+- **Exclusion mode** (sticky vs fixed-path) is a **global** config setting
+- **No async runtime** — no `tokio`. All I/O is either handled by thread pools or is trivial (single-file reads/writes, a handful of `tmutil` invocations)
+
+---
+
+## 2. Core Concepts
+
+### 2.1 Ignore Sources (two layers)
+
+| Source | Location | Purpose |
+|---|---|---|
+| `.gitignore` | Standard Git locations (repo root, subdirs, global) | Baseline: everything Git considers ignored is a candidate for TM exclusion |
+| `.lignore` | Anywhere a `.gitignore` can be placed (repo root, subdirectories, etc.) | **Override layer** — can **add** or **un-ignore** paths relative to `.gitignore` |
+
+#### `.lignore` Override Semantics: Union + Negate
+
+`.lignore` uses the **same gitignore syntax**. It is applied as an overlay on top of `.gitignore`:
+
+- **Plain lines** (e.g. `data/`) → **add** more paths to the TM exclusion set (even if not in `.gitignore`)
+- **Negated lines** (e.g. `!target/release/`) → **re-include** paths that `.gitignore` would exclude, removing them from the TM exclusion set
+
+**Example:**
+
+```gitignore
+# .gitignore          → target/ is excluded from Git (and thus from TM)
+target/
+
+# .lignore            → override for TM purposes
+!target/release/      → re-include target/release/ in TM backups
+data/large-dataset/   → additionally exclude from TM (may or may not be in .gitignore)
+```
+
+**Implementation:** Use the `ignore` crate's `OverrideBuilder` to layer `.lignore` rules on top of the `.gitignore` match results. This is the same mechanism ripgrep uses for `--glob` flags and supports `!` negation natively.
+
+### 2.2 Exclusion Modes
+
+`tmutil addexclusion` supports two modes:
+
+| Mode | Flag | Requires sudo? | Mechanism | Persistence |
+|---|---|---|---|---|
+| **Sticky** (default) | _(none)_ | No | Sets `com.apple.metadata:com_apple_backup_excludeItem` xattr on the item | Follows the file/dir if moved; **lost if item is deleted & recreated** |
+| **Fixed-path** | `-p` | Yes (root + Full Disk Access) | Adds path to a system-level exclusion list | Survives deletion; re-applies when a new item appears at that path |
+
+**Configuration:** Exclusion mode is a **global config setting** (`exclusion_mode` in `config.toml`). When set to `"fixed-path"`, the periodic service plist must run with `sudo` (as a LaunchDaemon rather than LaunchAgent).
+
+> [!IMPORTANT]
+> When the user switches exclusion modes, `letitgo reset` should be run first to clear the old exclusions, since sticky and fixed-path exclusions are tracked differently by macOS.
+
+### 2.3 State / Persistence: JSON Cache
+
+**Format:** A JSON file at `~/Library/Caches/letitgo/cache.json`, serialized with `serde_json`.
+
+```json
+{
+  "version": 1,
+  "last_run": "2026-02-27T02:00:00+08:00",
+  "exclusion_mode": "sticky",
+  "paths": [
+    "/Users/alice/project/target",
+    "/Users/alice/project/node_modules"
+  ]
+}
+```
+
+**Why JSON:**
+
+- **Power-efficient:** Single `read()` + single `write()` per run. No WAL/journal overhead.
+- **Fast:** At this data size (~KB), `serde_json` is more than sufficient.
+- **Simple:** No SQLite dependency. Easy to inspect and debug manually. Works on all architectures with zero config.
+- **Deduplication:** Done in-memory with a `HashSet` before writing.
+
+---
+
+## 3. CLI Interface
+
+```
+letitgo <COMMAND> [OPTIONS]
+
+Commands:
+  run       Scan, compute exclusions, and update Time Machine
+  list      Show currently excluded paths (from cache)
+  reset     Remove all exclusions made by letitgo and clear cache
+  clean     Validate cached paths and remove stale exclusions
+  init      Create a default config file with comments
+
+Global Options:
+  -c, --config <PATH>   Path to config file (default: ~/.config/letitgo/config.toml)
+  -v, --verbose         Increase log verbosity (repeat for more: -vv, -vvv)
+  -q, --quiet           Suppress non-error output
+  --dry-run             Show what would be done without making changes
+```
+
+### 3.1 `run` subcommand
+
+```
+letitgo run [OPTIONS]
+
+Options:
+  --search-path <DIR>   Override configured search paths (repeatable)
+```
+
+Scans search paths, computes exclusions, diffs against cache, updates Time Machine, and updates cache. **Implicitly cleans stale paths** — if a previously excluded path disappears from the scan (deleted or re-included by `.lignore`), it is automatically un-excluded.
+
+### 3.2 `list` subcommand
+
+```
+letitgo list [OPTIONS]
+
+Options:
+  --json                Output as JSON
+  --stale               Show only paths that no longer exist on disk
+```
+
+### 3.3 `clean` subcommand
+
+```
+letitgo clean
+
+  - Reads the cache
+  - Checks each path still exists on disk
+  - For stale paths: calls `tmutil removeexclusion` and removes from cache
+  - Logs summary
+```
+
+Useful for one-off cleanup without a full re-scan.
+
+### 3.4 `reset` subcommand
+
+```
+letitgo reset [OPTIONS]
+
+Options:
+  --yes                 Skip confirmation prompt
+```
+
+### 3.5 `init` subcommand
+
+```
+letitgo init [OPTIONS]
+
+Options:
+  --force               Overwrite existing config file
+```
+
+Creates a default `~/.config/letitgo/config.toml` with all options documented via inline comments. If the config file already exists, prints a message and exits (unless `--force` is used).
+
+---
+
+## 4. Configuration
+
+**Location:** `~/.config/letitgo/config.toml`
+
+On first run of any command (except `init`), if no config file exists, `letitgo` runs with sensible defaults and prints a one-time hint: _"No config found, using defaults. Run `letitgo init` to create one."_
+
+```toml
+# Directories to scan for Git repos
+search_paths = ["~"]
+
+# Directories to skip during scan
+ignored_paths = [
+    "~/.Trash",
+    "~/Applications",
+    "~/Downloads",
+    "~/Library",
+    "~/Music",
+    "~/Pictures",
+]
+
+# Glob patterns for paths to always include in backups (whitelist)
+whitelist = [
+    "**/application.yml",
+    "**/.env",
+    "**/.env.*",
+]
+
+# Exclusion mode: "sticky" (default) or "fixed-path"
+# "fixed-path" requires running with sudo
+exclusion_mode = "sticky"
+```
+
+---
+
+## 5. Architecture & Key Crates
+
+### 5.1 Execution Model: Synchronous + Thread Parallelism
+
+**No async runtime.** All parallelism is thread-based:
+
+| Operation | I/O characteristics | Parallelism approach |
+|---|---|---|
+| Directory traversal (find `.git` dirs) | I/O + CPU bound | `ignore::WalkBuilder::build_parallel()` — `crossbeam` thread pool |
+| Per-repo ignore resolution | I/O (small files) + CPU | `rayon::par_iter()` over discovered repos |
+| Reading/writing cache | I/O (single file) | Sequential — trivial, microseconds |
+| Reading config | I/O (single file) | Sequential — trivial |
+| Spawning `tmutil` processes | I/O (process spawn) | Sequential or `rayon` batched — only ~5-10 invocations |
+
+### 5.2 How the `ignore` Crate Parallelizes Walking
+
+The `ignore` crate (by BurntSushi, the ripgrep author) provides `WalkBuilder::build_parallel()`:
+
+1. Spawns a thread pool (defaults to number of logical CPUs)
+2. Work-stealing: each thread takes a directory off the queue, reads entries, pushes subdirectories back
+3. `.gitignore` rules are parsed and applied **during the walk**, so ignored subtrees are pruned early (never traversed)
+4. Uses `crossbeam` internally for the work-stealing deque
+
+### 5.3 Recommended Crates
+
+| Crate | Purpose |
+|---|---|
+| `ignore` | `.gitignore` parsing + parallel directory walking (by BurntSushi) |
+| `rayon` | Data-parallel iteration for per-repo processing and tmutil batching |
+| `clap` (derive) | CLI argument parsing |
+| `serde` + `toml` | Config file parsing |
+| `serde_json` | JSON cache serialization |
+| `tracing` + `tracing-subscriber` | Structured logging |
+| `anyhow` | Error handling |
+| `directories` | XDG/macOS standard paths (`~/Library/Caches`, etc.) |
+| `chrono` | Timestamps in cache |
+| `walkdir` | Raw directory traversal for the two-pass ignore resolution |
+| `fd-lock` | Advisory file locking for `/tmp/letitgo.lock` |
+
+### 5.4 Module Structure
+
+```
+src/
+├── main.rs           # Entry point, CLI dispatch
+├── cli.rs            # Clap command/arg definitions
+├── config.rs         # TOML config file parsing
+├── scanner.rs        # Repo discovery (parallel walk, find .git dirs)
+├── ignore.rs         # .gitignore + .lignore resolution, override logic
+├── tmutil.rs         # tmutil command wrapper (add/remove exclusion)
+├── cache.rs          # JSON cache read/write/diff
+├── clean.rs          # Path validation & stale cleanup
+└── error.rs          # Error types
+```
+
+---
+
+## 6. Core Algorithm (`run`)
+
+### 6.1 High-Level Flow
+
+```
+ 1. Load config (TOML)
+ 2. Load cache (JSON via serde_json — previous exclusion set as HashSet)
+ 3. Acquire lockfile (/tmp/letitgo.lock) — skip run if already held
+ 4. Scan search_paths for Git repos:
+    - Use ignore::WalkBuilder with parallel walking
+    - Filter for .git directories
+    - Skip ignored_paths from config
+    → Produces Vec<PathBuf> of repo roots
+ 5. For each repo (in parallel via rayon), resolve excluded paths:
+    → Two-pass algorithm (see §6.2 below)
+ 6. Merge all repos → deduplicated HashSet<PathBuf>
+ 7. Diff against cache:
+    - paths_to_add    = new_set - cached_set
+    - paths_to_remove = cached_set - new_set
+ 8. Batch tmutil calls (chunk by ~200 paths per invocation):
+    - For paths_to_add:    tmutil addexclusion [-p] <chunk>
+    - For paths_to_remove: tmutil removeexclusion [-p] <chunk>
+ 9. Update cache file with new_set + timestamp + exclusion_mode
+10. Release lockfile
+11. Log summary (# added, # removed, # total, duration)
+```
+
+### 6.2 Per-Repo Ignore Resolution (Two-Pass Algorithm)
+
+Extracting ignored paths from the `ignore` crate requires care, because
+`WalkBuilder` emits **non-ignored** entries and prunes ignored subtrees.
+We use `GitignoreBuilder` + `walkdir` instead, with a two-pass approach.
+
+```
+Pass 1 — Collect ignored directories (with pruning):
+
+  1. Build a Gitignore matcher from all .gitignore files in the repo
+     (root + subdirectories) using ignore::gitignore::GitignoreBuilder.
+  2. Walk the repo with walkdir::WalkDir.
+  3. For each entry, call gitignore.matched(path, is_dir):
+     - Match::Ignore + is_dir → add to excluded_dirs, call skip_current_dir()
+       (prune: don't descend into ignored directories)
+     - Match::Ignore + is_file → add to excluded_files (optional, see note)
+     - Match::None / Match::Whitelist → continue walking
+
+Pass 2 — Apply .lignore overrides (same-level only):
+
+  4. Load co-located .lignore files into a second GitignoreBuilder.
+  5. For plain (non-negated) lines in .lignore:
+     - Add matching paths to the exclusion set (additional exclusions).
+  6. For negation patterns (lines starting with `!`):
+     a. If the negated path exactly matches an entry in the exclusion set
+        (same-level), remove it. E.g. `!target/` removes `target/`.
+     b. If the negated path is a SUB-PATH of an excluded directory
+        (e.g., `!target/release/` while `target/` is excluded),
+        emit a runtime warning and skip:
+
+        WARN: .lignore negation `!target/release/` targets a sub-path of
+              excluded directory `target/`. Sub-path negation is not yet
+              supported — `target/` remains fully excluded from backups.
+
+  7. Apply whitelist from config: remove paths matching whitelist globs.
+```
+
+> [!NOTE]
+> **Directory-level vs file-level exclusion:** For efficiency, we primarily
+> track **directory-level** exclusions. Excluding `node_modules/` with one
+> `tmutil` call is far better than excluding thousands of files inside it.
+> Individual files are only tracked when they match a file-level gitignore
+> pattern (e.g., `*.log`) and are not inside an already-excluded directory.
+
+> [!NOTE]
+> **Sub-path negation** (e.g., `!target/release/` when `target/` is excluded)
+> is deferred to a future version. Implementing it correctly requires
+> "exploding" the parent exclusion into per-child exclusions, which adds
+> significant complexity. The runtime warning ensures users are aware of
+> the limitation.
+
+---
+
+## 7. Periodic Service (`brew services`)
+
+### 7.1 Sticky mode — LaunchAgent (no sudo)
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.ifsheldon.letitgo</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>HOMEBREW_PREFIX/bin/letitgo</string>
+        <string>run</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/letitgo-out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/letitgo-err.log</string>
+</dict>
+</plist>
+```
+
+### 7.2 Fixed-path mode — LaunchDaemon (requires sudo)
+
+When `exclusion_mode = "fixed-path"`, the plist would need to be installed as a LaunchDaemon (`/Library/LaunchDaemons/`) instead of a LaunchAgent, so it runs as root.
+
+> [!WARNING]
+> `brew services` installs LaunchAgents by default (user-level). For LaunchDaemons (root-level), `sudo brew services start letitgo` is needed. The Homebrew formula should document this distinction.
+
+### 7.3 Homebrew Formula (skeleton)
+
+```ruby
+class Letitgo < Formula
+  desc "Exclude gitignored files from Time Machine backups"
+  homepage "https://github.com/ifsheldon/LetItGo"
+  url "https://github.com/ifsheldon/LetItGo/archive/refs/tags/vX.Y.Z.tar.gz"
+  sha256 "..."
+  license "Apache-2.0"
+
+  depends_on :macos
+
+  def install
+    system "cargo", "install", *std_cargo_args
+  end
+
+  service do
+    run [opt_bin/"letitgo", "run"]
+    run_type :cron
+    cron "0 2 * * *"
+    log_path var/"log/letitgo.log"
+    error_log_path var/"log/letitgo.log"
+  end
+
+  test do
+    assert_match "letitgo", shell_output("#{bin}/letitgo --version")
+  end
+end
+```
+
+---
+
+## 8. Scope: v1 vs Future
+
+| Feature | v1 | Future |
+|---|---|---|
+| `.gitignore` parsing + TM exclusion | ✅ | |
+| `.lignore` support (Union + Negate) | ✅ | |
+| Sticky exclusion mode | ✅ | |
+| Fixed-path exclusion mode (`-p`) | ✅ | |
+| JSON cache + diff (`serde_json`) | ✅ | |
+| `run`, `list`, `reset`, `clean` commands | ✅ | |
+| `--dry-run` | ✅ | |
+| Homebrew formula + `brew services` | ✅ | |
+| Config file (TOML) | ✅ | |
+| iCloud Drive exclusion (`com.apple.fileprovider.ignore#P` xattr) | | TODO |
+| `status` command (rich summary dashboard) | | TODO |
+| Real-time file-system watcher (via `notify` / FSEvents) | | TODO |
+
+### TODO: Real-time File-System Watcher (Future)
+
+> [!NOTE]
+> **Concept:** Instead of a periodic cron job, run `letitgo` as a persistent daemon that watches code directories via macOS FSEvents (using the [`notify`](https://docs.rs/notify) crate). When `.gitignore` or `.lignore` files change, or when new directories matching ignored patterns appear, TM exclusions are updated immediately.
+>
+> **Considerations:**
+>
+> - Requires a long-running daemon (LaunchAgent/Daemon), not a periodic job
+> - Needs event debouncing (filesystem events fire rapidly during builds)
+> - Higher baseline memory/power usage vs periodic job (keeps file watchers open)
+> - Different execution model — may warrant a separate `letitgo watch` subcommand
+> - FSEvents on macOS is efficient (kernel-level, coalesced), so power impact is moderate
+>
+> **When to implement:** After v1 is stable and real-world usage confirms that periodic scanning is insufficient (e.g., users want instant exclusion of `node_modules` after `npm install`).
+
+---
+
+## 9. Edge Cases to Handle
+
+1. **Nested Git repos** (submodules) — each should be scanned independently
+2. **Symlinks** — do NOT follow them (avoid infinite loops)
+3. **Very large repos** — e.g. monorepos with thousands of ignored paths. Batch `tmutil` calls (200 paths per invocation)
+4. **Permission errors** — some dirs may not be readable. Log warning and skip
+5. **Concurrent runs** — protected by `/tmp/letitgo.lock` advisory file lock. If a second instance can't acquire the lock, it logs a warning and exits gracefully.
+6. **`tmutil` failures** — handle non-zero exit codes gracefully (e.g. exit code 213 = path not found, safe to ignore)
+7. **Mode switching** — if user switches from sticky to fixed-path (or vice versa), warn that `reset` should be run first to clean up the old exclusion type. Record the mode in the cache file for detection
+8. **Empty `.lignore`** — if present but empty, it has no effect (neither adds nor negates)
+9. **Global `.gitignore`** — the `ignore` crate respects `core.excludesfile` from Git config automatically
+
+---
+
+## 10. Testing Strategy
+
+### Design Constraint
+
+This tool runs on a daily-use Mac. Tests must **never** leave permanent files,
+configs, xattrs, or system-level changes. Everything must be isolated and
+automatically cleaned up.
+
+### 10.1 Dependency Injection for `tmutil`
+
+The core architectural decision for testability: abstract `tmutil` behind a trait.
+Production code calls the real binary; tests use a mock that records calls.
+
+```rust
+pub trait ExclusionManager {
+    fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
+    fn remove_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
+    fn is_excluded(&self, path: &Path) -> Result<bool>;
+}
+
+/// Production: calls /usr/bin/tmutil
+pub struct TmutilManager;
+
+/// Tests: records calls in-memory, never touches the system
+pub struct MockExclusionManager {
+    pub added: RefCell<Vec<PathBuf>>,
+    pub removed: RefCell<Vec<PathBuf>>,
+}
+```
+
+### 10.2 Configurable Paths via `AppContext`
+
+All file system paths are injectable through a context struct, so tests can
+redirect everything to a temp directory:
+
+```rust
+pub struct AppContext {
+    pub config_path: PathBuf,              // default: ~/.config/letitgo/config.toml
+    pub cache_path: PathBuf,               // default: ~/Library/Caches/letitgo/cache.json
+    pub lock_path: PathBuf,                // default: /tmp/letitgo.lock
+    pub exclusion_manager: Box<dyn ExclusionManager>,
+}
+```
+
+In tests:
+
+```rust
+#[test]
+fn test_run_excludes_gitignored_dirs() {
+    let tmp = tempfile::tempdir().unwrap();  // auto-deleted on Drop
+    let mock = MockExclusionManager::new();
+    let ctx = AppContext {
+        config_path: tmp.path().join("config.toml"),
+        cache_path: tmp.path().join("cache.json"),
+        lock_path: tmp.path().join("letitgo.lock"),
+        exclusion_manager: Box::new(mock),
+    };
+    // ... create fake repo with .gitignore in tmp ...
+    // ... run the algorithm ...
+    // ... assert mock.added contains expected paths ...
+}   // tmp dir + all contents deleted here automatically
+```
+
+### 10.3 Test Levels
+
+| Level | What it tests | System impact | Runs in CI? |
+|---|---|---|---|
+| **Unit tests** | Config parsing, cache read/write/diff, ignore resolution, CLI args | **None** — temp dirs only | ✅ |
+| **Integration tests** | Full `run`/`clean`/`reset`/`list` flow with mock tmutil | **None** — mock + temp dirs | ✅ |
+| **Smoke tests** (manual) | Actually calls `tmutil` on temp files, verifies xattr, cleans up | **Temporary** — cleanup in test | Manual only |
+
+### 10.4 Test Fixtures: Fake Git Repos
+
+Create throwaway repos in `tempdir()` with `.gitignore` and `.lignore` files:
+
+```rust
+/// Creates a fake Git repo structure in a temp directory
+fn create_test_repo(root: &Path) -> PathBuf {
+    let repo = root.join("test-repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("target/debug")).unwrap();
+    fs::create_dir_all(repo.join("target/release")).unwrap();
+    fs::create_dir_all(repo.join("node_modules/foo")).unwrap();
+    fs::write(repo.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+    repo
+}
+
+/// Creates a repo with .lignore override
+fn create_test_repo_with_lignore(root: &Path) -> PathBuf {
+    let repo = create_test_repo(root);
+    fs::write(repo.join(".lignore"), "!target/\ndata/\n").unwrap();
+    fs::create_dir_all(repo.join("data")).unwrap();
+    repo
+}
+```
+
+### 10.5 Key Test Scenarios
+
+**Unit tests:**
+
+- Config: parse valid TOML, missing fields use defaults, invalid TOML returns error
+- Cache: round-trip read/write, diff computation (added/removed sets), empty cache
+- Ignore resolution: `.gitignore` patterns match correctly, `.lignore` additions/negations work, whitelist filters paths, sub-path negation emits warning
+
+**Integration tests:**
+
+- `run` on a fresh repo: mock receives correct `add_exclusions` calls, cache file is written
+- `run` on a repo with existing cache: only diff is sent to mock (new paths added, stale paths removed)
+- `run` with `.lignore` negation: negated paths are NOT in mock's `added` list
+- `clean` with stale paths: mock receives `remove_exclusions`, cache is updated
+- `reset`: mock receives `remove_exclusions` for ALL cached paths, cache is deleted
+- `list`: reads cache and prints paths (no mock interaction)
+- `init`: creates config file with comments, `--force` overwrites
+- Lockfile: concurrent run attempt exits gracefully
+
+**Smoke tests (manual, opt-in):**
+
+- Create temp dir, call real `tmutil addexclusion`, verify xattr is set, call `tmutil removeexclusion`, verify xattr is removed
+
+### 10.6 Test Crates
+
+| Crate | Purpose |
+|---|---|
+| `tempfile` | Creates temp dirs/files that auto-delete on `Drop` |
+| `assert_cmd` | CLI integration tests — run the compiled binary, check stdout/stderr/exit code |
+| `predicates` | Fluent assertion helpers for `assert_cmd` output matching |
