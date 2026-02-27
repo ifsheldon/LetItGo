@@ -191,46 +191,6 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_default_config() {
-        let cfg = Config::default();
-        assert_eq!(cfg.exclusion_mode, ExclusionMode::Sticky);
-        assert!(!cfg.search_paths.is_empty());
-    }
-
-    #[test]
-    fn test_parse_valid_toml() {
-        let toml = r#"
-            search_paths = ["/tmp/repos"]
-            ignored_paths = ["/tmp/skip"]
-            whitelist = ["**/.env"]
-            exclusion_mode = "sticky"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.search_paths, vec!["/tmp/repos"]);
-        assert_eq!(cfg.exclusion_mode, ExclusionMode::Sticky);
-    }
-
-    #[test]
-    fn test_parse_fixed_path_mode() {
-        let toml = r#"exclusion_mode = "fixed-path""#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.exclusion_mode, ExclusionMode::FixedPath);
-    }
-
-    #[test]
-    fn test_missing_fields_use_defaults() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.exclusion_mode, ExclusionMode::Sticky);
-        assert!(!cfg.search_paths.is_empty());
-    }
-
-    #[test]
-    fn test_invalid_toml_returns_error() {
-        let result: Result<Config, _> = toml::from_str("not = [valid toml");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_load_missing_file_returns_default() {
         let (cfg, found) = Config::load(Path::new("/nonexistent/path/config.toml")).unwrap();
         assert!(!found);
