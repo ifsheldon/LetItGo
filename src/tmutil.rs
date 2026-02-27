@@ -1,8 +1,23 @@
 use anyhow::{Context, Result};
-use std::{path::Path, process::Command};
-use tracing::{debug, warn};
+use std::{
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+use tracing::{debug, info, warn};
 
 use crate::error::is_tmutil_safe_error;
+
+/// Maximum number of paths per `tmutil` subprocess invocation.
+///
+/// Kept small so that a single hanging path (e.g. on an unresponsive FUSE/
+/// network mount) doesn't stall all remaining work.  20 paths × ~100 bytes
+/// each is well within `ARG_MAX`.
+const TMUTIL_BATCH_SIZE: usize = 20;
+
+/// How long to wait for a single `tmutil` subprocess before killing it.
+const TMUTIL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Abstraction over Time Machine exclusion operations.
 ///
@@ -15,7 +30,7 @@ pub trait ExclusionManager: Send + Sync {
     ///
     /// When `fixed_path` is `true`, passes the `-p` flag to `tmutil`, which
     /// registers the paths in the system plist instead of setting xattrs.
-    /// Paths are processed in chunks of 200 to stay within `ARG_MAX`.
+    /// Paths are processed in small batches with a per-subprocess timeout.
     fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()>;
 
     /// Remove Time Machine exclusions for each path in `paths`.
@@ -53,23 +68,11 @@ pub struct TmutilManager;
 
 impl ExclusionManager for TmutilManager {
     fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        for chunk in paths.chunks(200) {
-            run_tmutil("addexclusion", chunk, fixed_path)?;
-        }
-        Ok(())
+        run_tmutil_batched("addexclusion", paths, fixed_path)
     }
 
     fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        for chunk in paths.chunks(200) {
-            run_tmutil("removeexclusion", chunk, fixed_path)?;
-        }
-        Ok(())
+        run_tmutil_batched("removeexclusion", paths, fixed_path)
     }
 
     fn is_excluded(&self, path: &Path) -> Result<bool> {
@@ -84,11 +87,42 @@ impl ExclusionManager for TmutilManager {
     }
 }
 
-/// Invoke `/usr/bin/tmutil <verb> [-p] <paths…>` and handle its exit code.
+/// Process `paths` through `tmutil <verb>` in small batches with progress
+/// logging and a per-subprocess timeout.
 ///
-/// Exit code 213 (path not found) is treated as non-fatal and logged as a
-/// warning; any other non-zero exit code returns an error.  The `-p` flag is
-/// included only when `fixed_path` is `true`.
+/// If a batch times out, the subprocess is killed and those paths are skipped
+/// with a warning — the remaining batches continue normally.
+fn run_tmutil_batched(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let chunks: Vec<&[&Path]> = paths.chunks(TMUTIL_BATCH_SIZE).collect();
+    let total = chunks.len();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        info!(
+            "tmutil {}: batch {}/{} ({} path(s))",
+            verb,
+            i + 1,
+            total,
+            chunk.len()
+        );
+        run_tmutil(verb, chunk, fixed_path)?;
+    }
+
+    Ok(())
+}
+
+/// Invoke `/usr/bin/tmutil <verb> [-p] <paths…>` with a timeout.
+///
+/// The subprocess is spawned asynchronously and polled via `try_wait()`.
+/// If it does not complete within [`TMUTIL_TIMEOUT`], it is killed and the
+/// batch is skipped with a warning (non-fatal).
+///
+/// Exit code 213 (path not found) is treated as non-fatal.  Any other
+/// non-zero exit code returns an error.  The `-p` flag is included only
+/// when `fixed_path` is `true`.
 fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
     let mut cmd = Command::new("/usr/bin/tmutil");
     cmd.arg(verb);
@@ -106,26 +140,56 @@ fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
         fixed_path
     );
 
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("spawning tmutil {verb}"))?;
 
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
+    // Poll for completion with timeout
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().context("checking tmutil status")? {
+            Some(status) => break status,
+            None if start.elapsed() >= TMUTIL_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait(); // reap zombie
+                warn!(
+                    "tmutil {} timed out after {}s — skipping {} path(s)",
+                    verb,
+                    TMUTIL_TIMEOUT.as_secs(),
+                    paths.len(),
+                );
+                for p in paths {
+                    warn!("  timed-out path: {}", p.display());
+                }
+                return Ok(()); // non-fatal: continue with remaining batches
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+
+    // Check exit status
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        let stderr_output = child
+            .stderr
+            .take()
+            .map(|mut s| {
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default();
         if is_tmutil_safe_error(code) {
             warn!(
                 "tmutil {} exited with code {} (safe, ignored): {}",
-                verb,
-                code,
-                String::from_utf8_lossy(&output.stderr)
+                verb, code, stderr_output
             );
         } else {
-            anyhow::bail!(
-                "tmutil {} failed (exit {}): {}",
-                verb,
-                code,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            anyhow::bail!("tmutil {} failed (exit {}): {}", verb, code, stderr_output);
         }
     }
 
