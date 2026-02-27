@@ -166,8 +166,8 @@ fn cmd_run(
     let start = Instant::now();
 
     // Acquire lockfile — skip if already held by another instance
-    let lock_file = acquire_lock(&ctx.lock_path)?;
-    let Some(mut _lock_guard) = lock_file else {
+    let mut lock = open_lock_file(&ctx.lock_path)?;
+    let Ok(_guard) = lock.try_write() else {
         warn!("Another letitgo instance is running. Skipping.");
         return Ok(());
     };
@@ -392,8 +392,8 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
     }
 
     // Acquire lock after confirmation prompt (before any mutations)
-    let lock_file = acquire_lock(&ctx.lock_path)?;
-    let Some(_guard) = lock_file else {
+    let mut lock = open_lock_file(&ctx.lock_path)?;
+    let Ok(_guard) = lock.try_write() else {
         warn!("Another letitgo instance is running. Skipping.");
         return Ok(());
     };
@@ -429,8 +429,8 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
 /// count of stale paths but does not modify the cache or call `tmutil`.
 fn cmd_clean(ctx: &AppContext, config: &Config, dry_run: bool) -> Result<()> {
     // Acquire lock — clean mutates the cache
-    let lock_file = acquire_lock(&ctx.lock_path)?;
-    let Some(_guard) = lock_file else {
+    let mut lock = open_lock_file(&ctx.lock_path)?;
+    let Ok(_guard) = lock.try_write() else {
         warn!("Another letitgo instance is running. Skipping.");
         return Ok(());
     };
@@ -478,23 +478,21 @@ fn cmd_init(ctx: &AppContext, force: bool) -> Result<()> {
 
 // ─── Lockfile ─────────────────────────────────────────────────────────────────
 
-/// Attempt to acquire the advisory lockfile at `lock_path`.
+/// Open (or create) the lockfile and return it wrapped in an `RwLock`.
 ///
-/// Returns `Some(guard)` if the lock was acquired, `None` if another `letitgo`
-/// instance already holds it.  The caller must keep the guard alive for the
-/// duration of the exclusive section — dropping it releases the lock.
-///
-/// # Implementation note
-///
-/// `fd-lock`'s `RwLockWriteGuard` has a lifetime tied to the `RwLock` it came
-/// from, making it impossible to return both together in a safe API.  To work
-/// around this, the `RwLock` is heap-allocated and then deliberately leaked via
-/// [`Box::leak`] to obtain a `'static` reference.  The "leak" is bounded: the
-/// program exits after the command completes, at which point the OS reclaims all
-/// memory anyway.  The `flock(2)` underlying the guard is released by the OS on
-/// process exit, even on `SIGKILL`.
-fn acquire_lock(lock_path: &Path) -> Result<Option<fd_lock::RwLockWriteGuard<'_, fs::File>>> {
+/// The caller should call [`try_write()`](FdRwLock::try_write) on the returned
+/// value and keep the resulting guard alive for the duration of the exclusive
+/// section.  Dropping the guard releases the lock; the OS also releases it
+/// automatically on process exit (even on `SIGKILL`) because `flock(2)` locks
+/// are per-open-file-description.
+fn open_lock_file(lock_path: &Path) -> Result<FdRwLock<fs::File>> {
     use std::fs::OpenOptions;
+
+    // Ensure the parent directory exists (lockfile lives next to cache).
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating lockfile dir: {}", parent.display()))?;
+    }
 
     let file = OpenOptions::new()
         .create(true)
@@ -503,12 +501,7 @@ fn acquire_lock(lock_path: &Path) -> Result<Option<fd_lock::RwLockWriteGuard<'_,
         .open(lock_path)
         .with_context(|| format!("opening lockfile: {}", lock_path.display()))?;
 
-    let lock: &'static mut FdRwLock<fs::File> = Box::leak(Box::new(FdRwLock::new(file)));
-
-    match lock.try_write() {
-        Ok(guard) => Ok(Some(guard)),
-        Err(_) => Ok(None),
-    }
+    Ok(FdRwLock::new(file))
 }
 
 // ─── Integration tests ────────────────────────────────────────────────────────
