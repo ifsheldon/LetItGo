@@ -25,8 +25,6 @@ ignored_paths = [
 # even if they are matched by .gitignore.
 whitelist = [
     "**/application.yml",
-    "**/.env",
-    "**/.env.*",
 ]
 
 # Exclusion mode: "sticky" (default) or "fixed-path"
