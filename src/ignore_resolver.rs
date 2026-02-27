@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 /// for a single Git repository, applying .gitignore and .lignore rules.
 ///
 /// Uses a single-pass algorithm: `.gitignore` files are discovered incrementally
-/// during the walk, and the matcher is rebuilt each time a new one is found.
+/// during the walk, and a per-directory matcher is built for each one.
 /// Ignored directories are physically pruned via `skip_current_dir()`, so large
 /// trees like `node_modules/` are never traversed.
 ///
@@ -26,13 +26,19 @@ pub fn resolve_excluded_paths(
 
     // ---- Single-pass: walk + incremental .gitignore discovery ----
 
+    // Each `.gitignore` gets its own Gitignore matcher rooted at the directory
+    // containing that file.  A single flat GitignoreBuilder rooted at repo_root
+    // cannot correctly scope anchored patterns (e.g. `/target/`) from nested
+    // `.gitignore` files — the `ignore` crate requires the builder root to
+    // match the file's parent for anchored patterns to resolve.
+    let mut matchers: Vec<(PathBuf, Gitignore)> = Vec::new();
+
     // Pre-load the root .gitignore (if any) so its rules apply to first-level entries.
-    let mut gitignore_files: Vec<PathBuf> = Vec::new();
     let root_gi = repo_root.join(".gitignore");
     if root_gi.exists() {
-        gitignore_files.push(root_gi);
+        let m = build_gitignore(repo_root, &root_gi)?;
+        matchers.push((repo_root.to_path_buf(), m));
     }
-    let mut matcher = build_gitignore_from_files(repo_root, &gitignore_files)?;
 
     // Use a while-let loop so we can call skip_current_dir() for physical pruning.
     let mut walker = WalkDir::new(repo_root)
@@ -58,12 +64,6 @@ pub fn resolve_excluded_paths(
             continue;
         }
 
-        // Relative path from repo root, needed by gitignore matching
-        let rel = match path.strip_prefix(repo_root) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
         // Skip if any parent is already in excluded set (logical pruning)
         let mut ancestor_excluded = false;
         for ancestor in path.ancestors().skip(1) {
@@ -80,18 +80,23 @@ pub fn resolve_excluded_paths(
         }
 
         // For non-ignored directories: check if they contain a .gitignore and
-        // rebuild the matcher. This must happen BEFORE the ignore check so that
-        // children of this directory see the updated rules.
+        // build a new per-directory matcher.  This must happen BEFORE the ignore
+        // check so that children of this directory see the updated rules.
         if is_dir {
             let gi_path = path.join(".gitignore");
-            if gi_path.exists() && !gitignore_files.contains(&gi_path) {
-                gitignore_files.push(gi_path);
-                matcher = build_gitignore_from_files(repo_root, &gitignore_files)?;
+            if gi_path.exists() {
+                let already = matchers.iter().any(|(d, _)| d == path);
+                if !already {
+                    let m = build_gitignore(path, &gi_path)?;
+                    matchers.push((path.to_path_buf(), m));
+                }
             }
         }
 
-        // Check if this entry is ignored
-        match matcher.matched(rel, is_dir) {
+        // Check the path against all matchers from deepest to shallowest.
+        // A deeper .gitignore takes precedence: Ignore → excluded,
+        // Whitelist (negation) → not excluded, None → fall through to parent.
+        match match_against_all(path, is_dir, &matchers) {
             ignore::Match::Ignore(_) => {
                 debug!("gitignore match: {}", path.display());
                 excluded.insert(path.to_path_buf());
@@ -114,18 +119,39 @@ pub fn resolve_excluded_paths(
     Ok(excluded)
 }
 
-/// Build a `Gitignore` matcher from a list of `.gitignore` file paths.
-///
-/// Called each time a new `.gitignore` file is discovered during the walk.
-/// The cost is O(N) in the number of files, but N is typically < 10.
-fn build_gitignore_from_files(repo_root: &Path, files: &[PathBuf]) -> Result<Gitignore> {
-    let mut builder = GitignoreBuilder::new(repo_root);
-    for path in files {
-        if let Some(err) = builder.add(path) {
-            warn!("Error reading {}: {}", path.display(), err);
-        }
+/// Build a single `Gitignore` matcher for one `.gitignore` file, rooted at
+/// the directory containing that file.
+fn build_gitignore(dir: &Path, gitignore_path: &Path) -> Result<Gitignore> {
+    let mut builder = GitignoreBuilder::new(dir);
+    if let Some(err) = builder.add(gitignore_path) {
+        warn!("Error reading {}: {}", gitignore_path.display(), err);
     }
     builder.build().context("building gitignore matcher")
+}
+
+/// Check `path` against a stack of per-directory matchers.
+///
+/// Matchers are checked from deepest (last) to shallowest (first).
+/// A deeper `.gitignore` takes precedence: `Ignore` → excluded,
+/// `Whitelist` (negation pattern) → not excluded, `None` → fall through.
+fn match_against_all<'a>(
+    path: &Path,
+    is_dir: bool,
+    matchers: &'a [(PathBuf, Gitignore)],
+) -> ignore::Match<&'a ignore::gitignore::Glob> {
+    for (dir, matcher) in matchers.iter().rev() {
+        // Only check matchers whose directory is an ancestor of this path
+        let rel = match path.strip_prefix(dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let m = matcher.matched(rel, is_dir);
+        match m {
+            ignore::Match::Ignore(_) | ignore::Match::Whitelist(_) => return m,
+            ignore::Match::None => continue,
+        }
+    }
+    ignore::Match::None
 }
 
 /// Apply `.lignore` override files:
@@ -524,6 +550,57 @@ mod tests {
         );
         // target/ should still be excluded
         assert!(excluded.contains(&repo.join("target")));
+    }
+
+    #[test]
+    fn test_nested_gitignore_anchored_pattern_prunes_directory() {
+        // Reproduces: root .gitignore has `out` (unanchored), subdirectory
+        // .gitignore has `/target/` (anchored).  target/ should be matched
+        // and pruned as a single entry — individual `out` dirs inside it
+        // must NOT appear in the exclusion set.
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("test-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // Root .gitignore: unanchored `out` matches `out` at any depth
+        fs::write(repo.join(".gitignore"), "out\n").unwrap();
+
+        // Subdirectory with its own anchored /target/ pattern
+        fs::create_dir_all(repo.join("src-tauri")).unwrap();
+        fs::write(repo.join("src-tauri/.gitignore"), "/target/\n").unwrap();
+
+        // Deep contents inside target/
+        fs::create_dir_all(repo.join("src-tauri/target/debug/build/serde-abc/out")).unwrap();
+        fs::create_dir_all(repo.join("src-tauri/target/debug/build/wry-xyz/out")).unwrap();
+
+        // Non-target `out` dir that SHOULD be excluded individually
+        fs::create_dir_all(repo.join("some-other/out")).unwrap();
+
+        let wl = empty_whitelist();
+        let excluded = resolve_excluded_paths(&repo, &wl).unwrap();
+
+        // target/ must be excluded as a whole directory
+        assert!(
+            excluded.contains(&repo.join("src-tauri/target")),
+            "src-tauri/target should be excluded by /target/ in src-tauri/.gitignore"
+        );
+
+        // Individual `out` dirs inside target/ must NOT be tracked separately
+        // (they're already covered by the parent target/ exclusion)
+        assert!(
+            !excluded.contains(&repo.join("src-tauri/target/debug/build/serde-abc/out")),
+            "out inside target/ should not be individually tracked — target/ was pruned"
+        );
+        assert!(
+            !excluded.contains(&repo.join("src-tauri/target/debug/build/wry-xyz/out")),
+            "out inside target/ should not be individually tracked — target/ was pruned"
+        );
+
+        // `out` outside target/ SHOULD be excluded (root .gitignore `out` pattern)
+        assert!(
+            excluded.contains(&repo.join("some-other/out")),
+            "out outside target/ should still be excluded by root .gitignore"
+        );
     }
 
     #[cfg(unix)]
