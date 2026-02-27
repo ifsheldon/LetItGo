@@ -64,22 +64,34 @@ pub fn write_cache(path: &Path, cache: &Cache) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("creating cache dir: {}", parent.display()))?;
 
-    // Sort paths for deterministic output (easier to diff/debug).
-    let mut sorted_paths = cache.paths.clone();
-    sorted_paths.sort();
-    let sorted_cache = Cache {
+    // Sort references for deterministic output (easier to diff/debug)
+    // without cloning the entire paths vector.
+    let mut sorted_refs: Vec<&PathBuf> = cache.paths.iter().collect();
+    sorted_refs.sort();
+
+    #[derive(Serialize)]
+    struct CacheRef<'a> {
+        version: u32,
+        last_run: Option<DateTime<FixedOffset>>,
+        exclusion_mode: &'a ExclusionMode,
+        paths: &'a [&'a PathBuf],
+    }
+    let sorted_cache = CacheRef {
         version: cache.version,
         last_run: cache.last_run,
-        exclusion_mode: cache.exclusion_mode.clone(),
-        paths: sorted_paths,
+        exclusion_mode: &cache.exclusion_mode,
+        paths: &sorted_refs,
     };
     let text = serde_json::to_string_pretty(&sorted_cache).context("serializing cache")?;
 
-    // Write to a sibling temp file, then atomically rename into place.
+    // Write to a sibling temp file, fsync, then atomically rename into place.
     let mut tmp = NamedTempFile::new_in(parent)
         .with_context(|| format!("creating temp file in {}", parent.display()))?;
     std::io::Write::write_all(&mut tmp, text.as_bytes())
         .with_context(|| format!("writing cache temp file in {}", parent.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("fsyncing cache temp file in {}", parent.display()))?;
     tmp.persist(path)
         .with_context(|| format!("persisting cache to {}", path.display()))?;
 
