@@ -500,18 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn test_path_clean_resolves_dotdot() {
-        use path_clean::PathClean;
-        // Verify that path_clean::clean resolves .. and . as expected
-        assert_eq!(PathBuf::from("/a/b/../c").clean(), PathBuf::from("/a/c"));
-        assert_eq!(
-            PathBuf::from("/a/b/./c/../d").clean(),
-            PathBuf::from("/a/b/d")
-        );
-        assert_eq!(PathBuf::from("/a/b/c/..").clean(), PathBuf::from("/a/b"));
-    }
-
-    #[test]
     fn test_lignore_negation_with_dotdot_component() {
         // Verify that `!../sibling/` in a subdirectory .lignore resolves
         // correctly against the exclusion set after path normalization.

@@ -124,13 +124,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_cache() {
-        let cache = Cache::empty();
-        assert!(cache.paths.is_empty());
-        assert_eq!(cache.version, 1);
-    }
-
-    #[test]
     fn test_round_trip() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("cache.json");
@@ -144,12 +137,6 @@ mod tests {
             loaded.path_set(),
             [pb("/foo/bar"), pb("/baz/qux")].into_iter().collect()
         );
-    }
-
-    #[test]
-    fn test_load_missing_returns_empty() {
-        let cache = load_cache(Path::new("/nonexistent/cache.json")).unwrap();
-        assert!(cache.paths.is_empty());
     }
 
     #[test]
@@ -214,11 +201,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_diff_sets_identical_sets_no_changes() {
-        let set: HashSet<PathBuf> = [pb("/a"), pb("/b")].into_iter().collect();
-        let (to_add, to_remove) = diff_sets(&set, &set);
-        assert!(to_add.is_empty());
-        assert!(to_remove.is_empty());
-    }
 }

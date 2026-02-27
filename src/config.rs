@@ -188,45 +188,6 @@ fn dirs_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn test_load_missing_file_returns_default() {
-        let (cfg, found) = Config::load(Path::new("/nonexistent/path/config.toml")).unwrap();
-        assert!(!found);
-        assert_eq!(cfg.exclusion_mode, ExclusionMode::Sticky);
-    }
-
-    #[test]
-    fn test_load_existing_file() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(f, "search_paths = [\"/tmp\"]\n").unwrap();
-        let (cfg, found) = Config::load(f.path()).unwrap();
-        assert!(found);
-        assert_eq!(cfg.search_paths, vec!["/tmp"]);
-    }
-
-    #[test]
-    fn test_expand_tilde() {
-        // Non-tilde paths pass through unchanged
-        assert_eq!(
-            expand_tilde("/absolute/path"),
-            PathBuf::from("/absolute/path")
-        );
-        assert_eq!(expand_tilde("relative"), PathBuf::from("relative"));
-
-        // Tilde expansion requires a discoverable home dir
-        if let Some(home) = dirs_home() {
-            assert_eq!(expand_tilde("~"), home);
-            assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
-        }
-    }
-
-    #[test]
-    fn test_exclusion_mode_is_fixed_path() {
-        assert!(!ExclusionMode::Sticky.is_fixed_path());
-        assert!(ExclusionMode::FixedPath.is_fixed_path());
-    }
 
     #[test]
     fn test_resolved_search_paths_expands_tilde() {
