@@ -132,9 +132,7 @@ fn build_gitignore_from_files(repo_root: &Path, files: &[PathBuf]) -> Result<Git
 /// - Negated patterns (`!pattern`) → remove from exclusion set (exact match only)
 fn apply_lignore_overrides(repo_root: &Path, excluded: &mut HashSet<PathBuf>) -> Result<()> {
     // Find all .lignore files, skipping .git and already-excluded directories.
-    let mut walker = WalkDir::new(repo_root)
-        .follow_links(false)
-        .into_iter();
+    let mut walker = WalkDir::new(repo_root).follow_links(false).into_iter();
 
     while let Some(entry_result) = walker.next() {
         let entry = match entry_result {
@@ -148,11 +146,11 @@ fn apply_lignore_overrides(repo_root: &Path, excluded: &mut HashSet<PathBuf>) ->
         let path = entry.path();
         let is_dir = entry.file_type().is_dir();
 
-        if is_dir {
-            if path.file_name().is_some_and(|n| n == ".git") || excluded.contains(path) {
-                walker.skip_current_dir();
-                continue;
-            }
+        if is_dir
+            && (path.file_name().is_some_and(|n| n == ".git") || excluded.contains(path))
+        {
+            walker.skip_current_dir();
+            continue;
         }
 
         if entry.file_type().is_file() && entry.file_name() == ".lignore" {
