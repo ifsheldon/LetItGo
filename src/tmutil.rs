@@ -14,7 +14,7 @@ use crate::error::is_tmutil_safe_error;
 /// Kept small so that a single hanging path (e.g. on an unresponsive FUSE/
 /// network mount) doesn't stall all remaining work.  20 paths × ~100 bytes
 /// each is well within `ARG_MAX`.
-const TMUTIL_BATCH_SIZE: usize = 20;
+const TMUTIL_BATCH_SIZE: usize = 10;
 
 /// How long to wait for a single `tmutil` subprocess before killing it.
 const TMUTIL_TIMEOUT: Duration = Duration::from_secs(30);
