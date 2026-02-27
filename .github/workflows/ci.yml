@@ -37,12 +37,15 @@ jobs:
   # Fixed-path mode (`-p`) writes to /Library/Preferences/com.apple.TimeMachine.plist
   # and is NOT tested here because it requires root. Sticky mode is the default.
   #
-  # IMPORTANT — why the fake repo lives under $HOME, not $RUNNER_TEMP:
-  # GitHub Actions registers $RUNNER_TEMP in the Time Machine fixed-path plist
-  # as part of runner setup.  macOS prefix-matches plist entries, so every path
-  # under $RUNNER_TEMP is reported as [Excluded] by `tmutil isexcluded` regardless
-  # of xattr state.  $HOME (/Users/runner) is not in the plist, so tmutil
-  # isexcluded there reflects only the xattrs letitgo actually sets.
+  # NOTE — why we check xattrs instead of `tmutil isexcluded`:
+  # GitHub Actions pre-excludes broad path trees (including $HOME and $RUNNER_TEMP)
+  # by setting the com.apple.metadata:com_apple_backup_excludeItem xattr on ancestor
+  # directories.  `tmutil isexcluded` inherits from parents, so it reports every
+  # path underneath as [Excluded] regardless of whether letitgo touched it.
+  # Reading the xattr directly on the specific item is authoritative:
+  #   - a newly created directory has no xattr → "not excluded" baseline is clean
+  #   - `tmutil addexclusion` sets the xattr on the exact path → detectable
+  #   - `tmutil removeexclusion` removes it → post-reset state is verifiable
   macos:
     name: macOS tests + real tmutil
     runs-on: macos-latest
@@ -60,10 +63,11 @@ jobs:
 
       # ── 2. Set up a fake git repo for real-tmutil tests ──────────────────────
       #
-      # Repo lives under $HOME so tmutil isexcluded reflects letitgo's xattrs only.
+      # We use $RUNNER_TEMP so paths are absolute, which tmutil requires.
+      # Two gitignored directories are created so we can verify both are excluded.
       - name: Set up fake git repo
         run: |
-          REPO="$HOME/letitgo-test-repo"
+          REPO="$RUNNER_TEMP/letitgo-test-repo"
           mkdir -p "$REPO/.git"
           mkdir -p "$REPO/target/debug"
           mkdir -p "$REPO/target/release"
@@ -88,21 +92,41 @@ jobs:
       - name: letitgo run --dry-run (no exclusions should be set)
         run: ./target/debug/letitgo --config "$CFG" --dry-run run --search-path "$REPO"
 
-      - name: Verify dry-run made no exclusions (target/)
-        run: tmutil isexcluded "$REPO/target" | grep -q '\[Not excluded\]'
+      - name: Verify dry-run left no exclusion xattr on target/
+        run: |
+          if xattr "$REPO/target" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr was set but --dry-run should not touch tmutil"
+            exit 1
+          fi
+          echo "OK: no exclusion xattr on target/"
 
-      - name: Verify dry-run made no exclusions (node_modules/)
-        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Not excluded\]'
+      - name: Verify dry-run left no exclusion xattr on node_modules/
+        run: |
+          if xattr "$REPO/node_modules" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr was set but --dry-run should not touch tmutil"
+            exit 1
+          fi
+          echo "OK: no exclusion xattr on node_modules/"
 
       # ── 4. Real run: letitgo calls tmutil addexclusion ────────────────────────
       - name: letitgo run (adds exclusions via real tmutil)
         run: ./target/debug/letitgo --config "$CFG" run --search-path "$REPO"
 
-      - name: Verify target/ is excluded (tmutil isexcluded)
-        run: tmutil isexcluded "$REPO/target" | grep -q '\[Excluded\]'
+      - name: Verify exclusion xattr is set on target/
+        run: |
+          if ! xattr "$REPO/target" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr is absent — tmutil addexclusion did not fire"
+            exit 1
+          fi
+          echo "OK: exclusion xattr present on target/"
 
-      - name: Verify node_modules/ is excluded (tmutil isexcluded)
-        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Excluded\]'
+      - name: Verify exclusion xattr is set on node_modules/
+        run: |
+          if ! xattr "$REPO/node_modules" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr is absent — tmutil addexclusion did not fire"
+            exit 1
+          fi
+          echo "OK: exclusion xattr present on node_modules/"
 
       # ── 5. list command ───────────────────────────────────────────────────────
       - name: letitgo list (plain text)
@@ -128,18 +152,33 @@ jobs:
       - name: letitgo run second time (idempotent — nothing changes)
         run: ./target/debug/letitgo --config "$CFG" run --search-path "$REPO"
 
-      - name: Verify target/ still excluded after second run
-        run: tmutil isexcluded "$REPO/target" | grep -q '\[Excluded\]'
+      - name: Verify exclusion xattr still set on target/ after second run
+        run: |
+          if ! xattr "$REPO/target" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr was unexpectedly removed"
+            exit 1
+          fi
+          echo "OK: exclusion xattr still present after idempotent run"
 
       # ── 8. Reset: removes all exclusions and clears the cache ─────────────────
       - name: letitgo reset --yes
         run: ./target/debug/letitgo --config "$CFG" reset --yes
 
-      - name: Verify target/ is no longer excluded after reset
-        run: tmutil isexcluded "$REPO/target" | grep -q '\[Not excluded\]'
+      - name: Verify exclusion xattr removed from target/ after reset
+        run: |
+          if xattr "$REPO/target" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr still present after reset"
+            exit 1
+          fi
+          echo "OK: exclusion xattr removed from target/"
 
-      - name: Verify node_modules/ is no longer excluded after reset
-        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Not excluded\]'
+      - name: Verify exclusion xattr removed from node_modules/ after reset
+        run: |
+          if xattr "$REPO/node_modules" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; then
+            echo "FAIL: exclusion xattr still present after reset"
+            exit 1
+          fi
+          echo "OK: exclusion xattr removed from node_modules/"
 
       - name: letitgo list (should show empty cache after reset)
         run: ./target/debug/letitgo --config "$CFG" list
@@ -149,10 +188,9 @@ jobs:
       # If an earlier step failed while exclusions were set, this ensures the
       # runner is left clean.  Errors are suppressed since the binary or config
       # may not exist if the build itself failed.
-      - name: Cleanup — remove any lingering exclusions and test repo
+      - name: Cleanup — remove any lingering exclusions
         if: always()
         run: |
           if [ -f ./target/debug/letitgo ] && [ -n "${CFG:-}" ]; then
             ./target/debug/letitgo --config "$CFG" reset --yes 2>/dev/null || true
           fi
-          rm -rf "$HOME/letitgo-test-repo"
