@@ -11,23 +11,36 @@ use walkdir::WalkDir;
 /// Resolve the set of paths that should be excluded from Time Machine backups
 /// for a single Git repository, applying .gitignore and .lignore rules.
 ///
+/// Uses a single-pass algorithm: `.gitignore` files are discovered incrementally
+/// during the walk, and the matcher is rebuilt each time a new one is found.
+/// Ignored directories are physically pruned via `skip_current_dir()`, so large
+/// trees like `node_modules/` are never traversed.
+///
 /// Returns a set of absolute `PathBuf`s.
 pub fn resolve_excluded_paths(
     repo_root: &Path,
     whitelist_globs: &GlobSet,
 ) -> Result<HashSet<PathBuf>> {
-    // ---- Pass 1: collect git-ignored paths via walkdir + GitignoreBuilder ----
-    let gitignore = build_gitignore(repo_root)?;
-
     let mut excluded: HashSet<PathBuf> = HashSet::new();
 
-    let walker = WalkDir::new(repo_root)
-        .follow_links(false) // never follow symlinks
+    // ---- Single-pass: walk + incremental .gitignore discovery ----
+
+    // Pre-load the root .gitignore (if any) so its rules apply to first-level entries.
+    let mut gitignore_files: Vec<PathBuf> = Vec::new();
+    let root_gi = repo_root.join(".gitignore");
+    if root_gi.exists() {
+        gitignore_files.push(root_gi);
+    }
+    let mut matcher = build_gitignore_from_files(repo_root, &gitignore_files)?;
+
+    // Use a while-let loop so we can call skip_current_dir() for physical pruning.
+    let mut walker = WalkDir::new(repo_root)
+        .follow_links(false)
         .min_depth(1)
         .into_iter();
 
-    'walk: for entry in walker {
-        let entry = match entry {
+    while let Some(entry_result) = walker.next() {
+        let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
                 warn!("Permission error walking {}: {}", repo_root.display(), e);
@@ -38,9 +51,10 @@ pub fn resolve_excluded_paths(
         let path = entry.path();
         let is_dir = entry.file_type().is_dir();
 
-        // Skip .git itself
+        // Skip .git directories (don't descend)
         if is_dir && path.file_name().is_some_and(|n| n == ".git") {
-            continue 'walk;
+            walker.skip_current_dir();
+            continue;
         }
 
         // Relative path from repo root, needed by gitignore matching
@@ -49,19 +63,40 @@ pub fn resolve_excluded_paths(
             Err(_) => continue,
         };
 
-        // Skip if any parent is already in excluded set (pruning)
+        // Skip if any parent is already in excluded set (logical pruning)
+        let mut ancestor_excluded = false;
         for ancestor in path.ancestors().skip(1) {
             if excluded.contains(ancestor) {
-                continue 'walk;
+                ancestor_excluded = true;
+                break;
+            }
+        }
+        if ancestor_excluded {
+            if is_dir {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+
+        // For non-ignored directories: check if they contain a .gitignore and
+        // rebuild the matcher. This must happen BEFORE the ignore check so that
+        // children of this directory see the updated rules.
+        if is_dir {
+            let gi_path = path.join(".gitignore");
+            if gi_path.exists() && !gitignore_files.contains(&gi_path) {
+                gitignore_files.push(gi_path);
+                matcher = build_gitignore_from_files(repo_root, &gitignore_files)?;
             }
         }
 
-        match gitignore.matched(rel, is_dir) {
+        // Check if this entry is ignored
+        match matcher.matched(rel, is_dir) {
             ignore::Match::Ignore(_) => {
                 debug!("gitignore match: {}", path.display());
                 excluded.insert(path.to_path_buf());
-                // If it's a directory, WalkDir will still descend by default;
-                // we handle pruning via the ancestor check above on next iterations.
+                if is_dir {
+                    walker.skip_current_dir(); // physical pruning
+                }
             }
             ignore::Match::Whitelist(_) | ignore::Match::None => {
                 // Continue walking
@@ -69,36 +104,27 @@ pub fn resolve_excluded_paths(
         }
     }
 
-    // ---- Pass 2: apply .lignore overrides ----
+    // ---- Apply .lignore overrides ----
     apply_lignore_overrides(repo_root, &mut excluded)?;
 
-    // ---- Pass 3: apply config whitelist ----
+    // ---- Apply config whitelist ----
     apply_whitelist(&mut excluded, whitelist_globs);
 
     Ok(excluded)
 }
 
-/// Build a `Gitignore` matcher by scanning for all `.gitignore` files under
-/// `repo_root` and adding them via `GitignoreBuilder`.
-fn build_gitignore(repo_root: &Path) -> Result<Gitignore> {
+/// Build a `Gitignore` matcher from a list of `.gitignore` file paths.
+///
+/// Called each time a new `.gitignore` file is discovered during the walk.
+/// The cost is O(N) in the number of files, but N is typically < 10.
+fn build_gitignore_from_files(repo_root: &Path, files: &[PathBuf]) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(repo_root);
-
-    // Walk for .gitignore files — we need to do a separate light walk to find them
-    for entry in WalkDir::new(repo_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file()
-            && entry.file_name() == ".gitignore"
-            && let Some(err) = builder.add(entry.path())
-        {
-            warn!("Error reading {}: {}", entry.path().display(), err);
+    for path in files {
+        if let Some(err) = builder.add(path) {
+            warn!("Error reading {}: {}", path.display(), err);
         }
     }
-
-    let gitignore = builder.build().context("building gitignore matcher")?;
-    Ok(gitignore)
+    builder.build().context("building gitignore matcher")
 }
 
 /// Apply `.lignore` override files:
