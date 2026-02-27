@@ -585,8 +585,8 @@ Production code calls the real binary; tests use a mock that records calls.
 // after rayon's parallel section completes. Without Send + Sync, the borrow checker
 // will reject any code that passes a reference to AppContext into a rayon::scope.
 pub trait ExclusionManager: Send + Sync {
-    fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
-    fn remove_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
+    fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()>;
+    fn remove_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()>;
     fn is_excluded(&self, path: &Path) -> Result<bool>;
 }
 
