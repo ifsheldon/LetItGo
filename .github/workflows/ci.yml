@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Lint: formatting and clippy ───────────────────────────────────────────────
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+  # ── macOS: unit tests + real tmutil integration ───────────────────────────────
+  #
+  # GitHub-hosted macOS runners (macos-latest = macOS 15 arm64) include tmutil
+  # and allow `addexclusion` / `removeexclusion` in sticky mode (xattr-based)
+  # without sudo or TCC permissions.  No real Time Machine destination is needed.
+  #
+  # Fixed-path mode (`-p`) writes to /Library/Preferences/com.apple.TimeMachine.plist
+  # and is NOT tested here because it requires root. Sticky mode is the default.
+  macos:
+    name: macOS tests + real tmutil
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # ── 1. Run all unit + integration tests (MockExclusionManager) on macOS ──
+      - name: cargo test (macOS)
+        run: cargo test
+
+      # ── 2. Set up a fake git repo for real-tmutil tests ──────────────────────
+      #
+      # We use $RUNNER_TEMP so paths are absolute, which tmutil requires.
+      # Two gitignored directories are created so we can verify both are excluded.
+      - name: Set up fake git repo
+        run: |
+          REPO="$RUNNER_TEMP/letitgo-test-repo"
+          mkdir -p "$REPO/.git"
+          mkdir -p "$REPO/target/debug"
+          mkdir -p "$REPO/target/release"
+          mkdir -p "$REPO/node_modules/lodash"
+          printf 'target/\nnode_modules/\n' > "$REPO/.gitignore"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+
+      # Write a config that scopes the scan to our fake repo only,
+      # with no whitelist entries and sticky (xattr) exclusion mode.
+      - name: Write letitgo config
+        run: |
+          CFG="$RUNNER_TEMP/letitgo-test-config.toml"
+          cat > "$CFG" <<EOF
+          search_paths = ["$REPO"]
+          ignored_paths = []
+          whitelist = []
+          exclusion_mode = "sticky"
+          EOF
+          echo "CFG=$CFG" >> "$GITHUB_ENV"
+
+      # ── 3. Dry-run: verify no real tmutil calls are made ─────────────────────
+      - name: letitgo run --dry-run (no exclusions should be set)
+        run: ./target/debug/letitgo --config "$CFG" --dry-run run --search-path "$REPO"
+
+      - name: Verify dry-run made no exclusions (target/)
+        run: tmutil isexcluded "$REPO/target" | grep -q '\[Not excluded\]'
+
+      - name: Verify dry-run made no exclusions (node_modules/)
+        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Not excluded\]'
+
+      # ── 4. Real run: letitgo calls tmutil addexclusion ────────────────────────
+      - name: letitgo run (adds exclusions via real tmutil)
+        run: ./target/debug/letitgo --config "$CFG" run --search-path "$REPO"
+
+      - name: Verify target/ is excluded (tmutil isexcluded)
+        run: tmutil isexcluded "$REPO/target" | grep -q '\[Excluded\]'
+
+      - name: Verify node_modules/ is excluded (tmutil isexcluded)
+        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Excluded\]'
+
+      # ── 5. list command ───────────────────────────────────────────────────────
+      - name: letitgo list (plain text)
+        run: ./target/debug/letitgo --config "$CFG" list
+
+      - name: letitgo list --json (verify path count >= 2)
+        run: |
+          COUNT=$(./target/debug/letitgo --config "$CFG" list --json \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")
+          echo "Excluded path count: $COUNT"
+          [ "$COUNT" -ge 2 ]
+
+      - name: letitgo list --stale (all paths exist — should report none stale)
+        run: ./target/debug/letitgo --config "$CFG" list --stale
+
+      # ── 6. clean command (no stale paths — all dirs still exist) ─────────────
+      - name: letitgo clean (should report no stale paths)
+        run: ./target/debug/letitgo --config "$CFG" clean
+
+      # ── 7. Second run: idempotency (diff should be empty) ────────────────────
+      #
+      # The cache already matches the current state, so no tmutil calls are made.
+      - name: letitgo run second time (idempotent — nothing changes)
+        run: ./target/debug/letitgo --config "$CFG" run --search-path "$REPO"
+
+      - name: Verify target/ still excluded after second run
+        run: tmutil isexcluded "$REPO/target" | grep -q '\[Excluded\]'
+
+      # ── 8. Reset: removes all exclusions and clears the cache ─────────────────
+      - name: letitgo reset --yes
+        run: ./target/debug/letitgo --config "$CFG" reset --yes
+
+      - name: Verify target/ is no longer excluded after reset
+        run: tmutil isexcluded "$REPO/target" | grep -q '\[Not excluded\]'
+
+      - name: Verify node_modules/ is no longer excluded after reset
+        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Not excluded\]'
+
+      - name: letitgo list (should show empty cache after reset)
+        run: ./target/debug/letitgo --config "$CFG" list
+
+      # ── 9. Cleanup: always run in case any step above fails ──────────────────
+      #
+      # If an earlier step failed while exclusions were set, this ensures the
+      # runner is left clean.  Errors are suppressed since the binary or config
+      # may not exist if the build itself failed.
+      - name: Cleanup — remove any lingering exclusions
+        if: always()
+        run: |
+          if [ -f ./target/debug/letitgo ] && [ -n "${CFG:-}" ]; then
+            ./target/debug/letitgo --config "$CFG" reset --yes 2>/dev/null || true
+          fi
