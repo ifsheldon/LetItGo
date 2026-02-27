@@ -34,7 +34,6 @@ pub trait ExclusionManager: Send + Sync {
 /// Blanket impl so `Arc<T>` can be used as an `ExclusionManager` in tests.
 /// This lets tests share a `MockExclusionManager` via `Arc` while still
 /// satisfying the `Box<dyn ExclusionManager>` requirement on `AppContext`.
-#[cfg(test)]
 impl<T: ExclusionManager> ExclusionManager for std::sync::Arc<T> {
     fn add_exclusions(&self, paths: &[&Path], fixed_path: bool) -> Result<()> {
         self.as_ref().add_exclusions(paths, fixed_path)
@@ -133,9 +132,8 @@ fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
     Ok(())
 }
 
-// ─── Mock implementation (test-only) ─────────────────────────────────────────
+// ─── Mock implementation (for testing) ───────────────────────────────────────
 
-#[cfg(test)]
 pub mod mock {
     use super::*;
     use std::path::PathBuf;

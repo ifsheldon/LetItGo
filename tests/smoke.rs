@@ -8,9 +8,12 @@
 // CI runs them on macOS runners.  `--test-threads=1` prevents parallel tmutil
 // calls from racing.
 
-use super::*;
-use crate::config::ExclusionMode;
+use letitgo::cache::load_cache;
+use letitgo::config::{Config, ExclusionMode};
+use letitgo::tmutil::TmutilManager;
+use letitgo::{AppContext, cmd_clean, cmd_init, cmd_reset, cmd_run};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 

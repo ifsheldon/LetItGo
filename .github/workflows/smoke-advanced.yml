@@ -6,9 +6,9 @@ name: "Smoke: advanced edge cases"
 on:
   push:
     branches: ["main"]
-    paths: ["src/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
+    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
   pull_request:
-    paths: ["src/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
+    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", ".github/workflows/**"]
 
 env:
   CARGO_TERM_COLOR: always

@@ -5,12 +5,14 @@ on:
     branches: ["main"]
     paths:
       - "src/**"
+      - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/**"
   pull_request:
     paths:
       - "src/**"
+      - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/**"
