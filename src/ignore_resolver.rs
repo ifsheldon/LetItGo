@@ -146,9 +146,7 @@ fn apply_lignore_overrides(repo_root: &Path, excluded: &mut HashSet<PathBuf>) ->
         let path = entry.path();
         let is_dir = entry.file_type().is_dir();
 
-        if is_dir
-            && (path.file_name().is_some_and(|n| n == ".git") || excluded.contains(path))
-        {
+        if is_dir && (path.file_name().is_some_and(|n| n == ".git") || excluded.contains(path)) {
             walker.skip_current_dir();
             continue;
         }
