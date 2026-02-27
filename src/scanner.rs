@@ -47,14 +47,14 @@ pub fn discover_repos(search_paths: &[PathBuf], ignored_paths: &[PathBuf]) -> Ve
                     }
                 }
 
-                // We're looking for .git *directories* (not files, for worktrees)
-                if entry.file_type().is_some_and(|ft| ft.is_dir())
-                    && entry.file_name() == ".git"
+                // We're looking for .git entries — either a directory (regular repos)
+                // or a file (submodules and worktrees use a file pointing to the
+                // actual git dir). WalkState::Skip is a no-op for files.
+                if entry.file_name() == ".git"
                     && let Some(repo_root) = path.parent()
                 {
                     debug!("Found repo: {}", repo_root.display());
                     repos.lock().unwrap().push(repo_root.to_path_buf());
-                    // Don't descend into .git itself
                     return WalkState::Skip;
                 }
 
@@ -139,6 +139,25 @@ mod tests {
         assert_eq!(repos.len(), 2);
         assert!(repos.contains(&dir1.join("repo-a")));
         assert!(repos.contains(&dir2.join("repo-b")));
+    }
+
+    #[test]
+    fn test_discover_repos_finds_git_file_submodule() {
+        let tmp = tempdir().unwrap();
+
+        // Simulate a submodule: .git is a file, not a directory
+        fs::create_dir_all(tmp.path().join("submod")).unwrap();
+        fs::write(
+            tmp.path().join("submod/.git"),
+            "gitdir: ../../.git/modules/submod\n",
+        )
+        .unwrap();
+
+        let repos = discover_repos(&[tmp.path().to_path_buf()], &[]);
+        assert!(
+            repos.contains(&tmp.path().join("submod")),
+            "repos with .git files (submodules) should be discovered"
+        );
     }
 
     #[cfg(unix)]

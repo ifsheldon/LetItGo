@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use cache::{Cache, diff_sets, load_cache, write_cache};
 use cli::{Cli, Commands};
@@ -120,10 +120,9 @@ fn main() -> Result<()> {
 /// | flags          | effective level |
 /// |----------------|-----------------|
 /// | `--quiet`      | `ERROR`         |
-/// | *(default)*    | `WARN`          |
-/// | `-v`           | `INFO`          |
-/// | `-vv`          | `DEBUG`         |
-/// | `-vvv`         | `TRACE`         |
+/// | *(default)*    | `INFO`          |
+/// | `-v`           | `DEBUG`         |
+/// | `-vv`          | `TRACE`         |
 ///
 /// The `RUST_LOG` environment variable takes precedence over all flags.
 fn init_tracing(verbose: u8, quiet: bool) {
@@ -133,9 +132,8 @@ fn init_tracing(verbose: u8, quiet: bool) {
         "error"
     } else {
         match verbose {
-            0 => "warn",
-            1 => "info",
-            2 => "debug",
+            0 => "info",
+            1 => "debug",
             _ => "trace",
         }
     };
@@ -180,9 +178,9 @@ fn cmd_run(
     };
     let ignored_paths = config.resolved_ignored_paths();
 
-    info!("Scanning {} search path(s)…", search_paths.len());
+    debug!("Scanning {} search path(s)…", search_paths.len());
     for sp in &search_paths {
-        info!("  {}", sp.display());
+        debug!("  {}", sp.display());
     }
 
     // Detect mode switch
@@ -199,7 +197,7 @@ fn cmd_run(
 
     // 1) Discover repos
     let repos = discover_repos(&search_paths, &ignored_paths);
-    info!("Found {} Git repo(s)", repos.len());
+    debug!("Found {} Git repo(s)", repos.len());
 
     // 2) Build whitelist globset
     let whitelist_globs = build_whitelist_globset(&config.whitelist)?;
@@ -218,11 +216,11 @@ fn cmd_run(
             acc
         });
 
-    info!("Total excluded paths computed: {}", new_set.len());
+    debug!("Total excluded paths computed: {}", new_set.len());
 
     // 4) Diff
     let (to_add, to_remove) = diff_sets(&old_set, &new_set);
-    info!(
+    debug!(
         "{} path(s) to add, {} path(s) to remove",
         to_add.len(),
         to_remove.len()
@@ -233,26 +231,26 @@ fn cmd_run(
 
     if dry_run {
         for p in &to_add {
-            eprintln!("[dry-run] would add exclusion: {}", p.display());
+            info!("[dry-run] would add exclusion: {}", p.display());
         }
         for p in &to_remove {
-            eprintln!("[dry-run] would remove exclusion: {}", p.display());
+            info!("[dry-run] would remove exclusion: {}", p.display());
         }
     } else {
         // Run add and remove in parallel (they're independent)
-        let add_result = std::thread::scope(|s| {
+        let (add_res, remove_res) = std::thread::scope(|s| {
             let add_handle = s.spawn(|| ctx.exclusion_manager.add_exclusions(&to_add, fixed_path));
-            let remove_result = ctx
+            let remove_res = ctx
                 .exclusion_manager
                 .remove_exclusions(&to_remove, fixed_path);
-            let add_result = add_handle.join().expect("add thread panicked");
-            (add_result, remove_result)
+            let add_res = add_handle.join().expect("add thread panicked");
+            (add_res, remove_res)
         });
 
-        if let Err(e) = add_result.0 {
+        if let Err(e) = add_res {
             warn!("Error adding exclusions: {}", e);
         }
-        if let Err(e) = add_result.1 {
+        if let Err(e) = remove_res {
             warn!("Error removing exclusions: {}", e);
         }
 
@@ -268,15 +266,10 @@ fn cmd_run(
 
     let elapsed = start.elapsed();
     info!(
-        "Done in {:.2}s — added: {}, removed: {}, total: {}",
+        "Done in {:.2}s — added {}, removed {}",
         elapsed.as_secs_f64(),
         to_add.len(),
         to_remove.len(),
-        if dry_run {
-            "N/A (dry-run)"
-        } else {
-            "see cache"
-        }
     );
 
     Ok(())
@@ -373,7 +366,7 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
     let cache = load_cache(&ctx.cache_path)?;
 
     if cache.paths.is_empty() {
-        eprintln!("Nothing to reset — cache is empty.");
+        info!("Nothing to reset — cache is empty.");
         return Ok(());
     }
 
@@ -386,7 +379,7 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-            eprintln!("Aborted.");
+            info!("Aborted.");
             return Ok(());
         }
     }
@@ -402,7 +395,7 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
 
     if dry_run {
         for p in &cache.paths {
-            eprintln!("[dry-run] would remove exclusion: {}", p.display());
+            info!("[dry-run] would remove exclusion: {}", p.display());
         }
     } else {
         ctx.exclusion_manager
@@ -412,7 +405,7 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
             fs::remove_file(&ctx.cache_path)
                 .with_context(|| format!("removing cache: {}", ctx.cache_path.display()))?;
         }
-        eprintln!(
+        info!(
             "Reset complete. {} exclusion(s) removed.",
             cache.paths.len()
         );
@@ -443,9 +436,9 @@ fn cmd_clean(ctx: &AppContext, config: &Config, dry_run: bool) -> Result<()> {
         dry_run,
     )?;
     if removed > 0 {
-        eprintln!("Removed {} stale exclusion(s).", removed);
+        info!("Removed {} stale exclusion(s).", removed);
     } else {
-        eprintln!("No stale paths found.");
+        info!("No stale paths found.");
     }
     Ok(())
 }
@@ -457,7 +450,7 @@ fn cmd_clean(ctx: &AppContext, config: &Config, dry_run: bool) -> Result<()> {
 /// Does nothing if the file already exists, unless `force` is `true`.
 fn cmd_init(ctx: &AppContext, force: bool) -> Result<()> {
     if ctx.config_path.exists() && !force {
-        eprintln!(
+        info!(
             "Config file already exists at {}. Use --force to overwrite.",
             ctx.config_path.display()
         );
@@ -472,7 +465,7 @@ fn cmd_init(ctx: &AppContext, force: bool) -> Result<()> {
     fs::write(&ctx.config_path, config::DEFAULT_CONFIG)
         .with_context(|| format!("writing config: {}", ctx.config_path.display()))?;
 
-    eprintln!("Config written to {}", ctx.config_path.display());
+    info!("Config written to {}", ctx.config_path.display());
     Ok(())
 }
 
@@ -510,7 +503,7 @@ fn open_lock_file(lock_path: &Path) -> Result<FdRwLock<fs::File>> {
 mod integration_tests {
     use super::*;
     use crate::config::ExclusionMode;
-    use crate::tmutil::MockExclusionManager;
+    use crate::tmutil::mock::MockExclusionManager;
     use std::fs;
     use std::sync::Arc;
     use tempfile::tempdir;

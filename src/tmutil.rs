@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
 };
 use tracing::{debug, warn};
 
@@ -35,10 +34,11 @@ pub trait ExclusionManager: Send + Sync {
     fn is_excluded(&self, path: &Path) -> Result<bool>;
 }
 
-/// Blanket impl so `Arc<T>` can be used as an `ExclusionManager`.
+/// Blanket impl so `Arc<T>` can be used as an `ExclusionManager` in tests.
 /// This lets tests share a `MockExclusionManager` via `Arc` while still
 /// satisfying the `Box<dyn ExclusionManager>` requirement on `AppContext`.
-impl<T: ExclusionManager> ExclusionManager for Arc<T> {
+#[cfg(test)]
+impl<T: ExclusionManager> ExclusionManager for std::sync::Arc<T> {
     fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
         self.as_ref().add_exclusions(paths, fixed_path)
     }
@@ -136,47 +136,50 @@ fn run_tmutil(verb: &str, paths: &[PathBuf], fixed_path: bool) -> Result<()> {
     Ok(())
 }
 
-// ─── Mock implementation ──────────────────────────────────────────────────────
+// ─── Mock implementation (test-only) ─────────────────────────────────────────
 
-/// Records calls in-memory; never touches the system.
-/// Uses `Mutex` (not `RefCell`) to satisfy `Send + Sync`.
-#[derive(Debug, Default)]
-pub struct MockExclusionManager {
-    pub added: Mutex<Vec<PathBuf>>,
-    pub removed: Mutex<Vec<PathBuf>>,
-}
+#[cfg(test)]
+pub mod mock {
+    use super::*;
+    use std::sync::Mutex;
 
-impl MockExclusionManager {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::default()
+    /// Records calls in-memory; never touches the system.
+    /// Uses `Mutex` (not `RefCell`) to satisfy `Send + Sync`.
+    #[derive(Debug, Default)]
+    pub struct MockExclusionManager {
+        pub added: Mutex<Vec<PathBuf>>,
+        pub removed: Mutex<Vec<PathBuf>>,
     }
 
-    /// Return a snapshot of all paths that have been passed to [`add_exclusions`](ExclusionManager::add_exclusions).
-    #[allow(dead_code)]
-    pub fn added_paths(&self) -> Vec<PathBuf> {
-        self.added.lock().unwrap().clone()
+    impl MockExclusionManager {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Return a snapshot of all paths that have been passed to [`add_exclusions`](ExclusionManager::add_exclusions).
+        pub fn added_paths(&self) -> Vec<PathBuf> {
+            self.added.lock().unwrap().clone()
+        }
+
+        /// Return a snapshot of all paths that have been passed to [`remove_exclusions`](ExclusionManager::remove_exclusions).
+        pub fn removed_paths(&self) -> Vec<PathBuf> {
+            self.removed.lock().unwrap().clone()
+        }
     }
 
-    /// Return a snapshot of all paths that have been passed to [`remove_exclusions`](ExclusionManager::remove_exclusions).
-    #[allow(dead_code)]
-    pub fn removed_paths(&self) -> Vec<PathBuf> {
-        self.removed.lock().unwrap().clone()
-    }
-}
+    impl ExclusionManager for MockExclusionManager {
+        fn add_exclusions(&self, paths: &[PathBuf], _fixed_path: bool) -> Result<()> {
+            self.added.lock().unwrap().extend_from_slice(paths);
+            Ok(())
+        }
 
-impl ExclusionManager for MockExclusionManager {
-    fn add_exclusions(&self, paths: &[PathBuf], _fixed_path: bool) -> Result<()> {
-        self.added.lock().unwrap().extend_from_slice(paths);
-        Ok(())
-    }
+        fn remove_exclusions(&self, paths: &[PathBuf], _fixed_path: bool) -> Result<()> {
+            self.removed.lock().unwrap().extend_from_slice(paths);
+            Ok(())
+        }
 
-    fn remove_exclusions(&self, paths: &[PathBuf], _fixed_path: bool) -> Result<()> {
-        self.removed.lock().unwrap().extend_from_slice(paths);
-        Ok(())
-    }
-
-    fn is_excluded(&self, path: &Path) -> Result<bool> {
-        Ok(self.added.lock().unwrap().contains(&path.to_path_buf()))
+        fn is_excluded(&self, path: &Path) -> Result<bool> {
+            Ok(self.added.lock().unwrap().contains(&path.to_path_buf()))
+        }
     }
 }
