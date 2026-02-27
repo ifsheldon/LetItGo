@@ -12,12 +12,17 @@ use crate::error::is_tmutil_safe_error;
 /// Maximum number of paths per `tmutil` subprocess invocation.
 ///
 /// Kept small so that a single hanging path (e.g. on an unresponsive FUSE/
-/// network mount) doesn't stall all remaining work.  20 paths × ~100 bytes
+/// network mount) doesn't stall all remaining work.  10 paths × ~100 bytes
 /// each is well within `ARG_MAX`.
 const TMUTIL_BATCH_SIZE: usize = 10;
 
-/// How long to wait for a single `tmutil` subprocess before killing it.
-const TMUTIL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for a batched `tmutil` subprocess before killing it.
+/// Setting xattrs is near-instant; if tmutil takes longer than this the
+/// process is likely blocked on a system lock or unresponsive filesystem.
+const TMUTIL_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shorter timeout used when retrying a single path after a batch timeout.
+const TMUTIL_SINGLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Abstraction over Time Machine exclusion operations.
 ///
@@ -90,8 +95,8 @@ impl ExclusionManager for TmutilManager {
 /// Process `paths` through `tmutil <verb>` in small batches with progress
 /// logging and a per-subprocess timeout.
 ///
-/// If a batch times out, the subprocess is killed and those paths are skipped
-/// with a warning — the remaining batches continue normally.
+/// If a batch times out, each path in that batch is retried individually
+/// with a shorter timeout.  Only truly problematic paths are skipped.
 fn run_tmutil_batched(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -99,6 +104,7 @@ fn run_tmutil_batched(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<(
 
     let chunks: Vec<&[&Path]> = paths.chunks(TMUTIL_BATCH_SIZE).collect();
     let total = chunks.len();
+    let mut timed_out_count: usize = 0;
 
     for (i, chunk) in chunks.iter().enumerate() {
         info!(
@@ -108,7 +114,36 @@ fn run_tmutil_batched(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<(
             total,
             chunk.len()
         );
-        run_tmutil(verb, chunk, fixed_path)?;
+        if !run_tmutil(verb, chunk, fixed_path, TMUTIL_BATCH_TIMEOUT)? {
+            continue; // batch completed successfully
+        }
+
+        // Batch timed out — retry each path individually to isolate
+        // the problematic one(s) instead of skipping the whole batch.
+        warn!(
+            "Batch {}/{} timed out — retrying {} path(s) individually",
+            i + 1,
+            total,
+            chunk.len()
+        );
+        for path in *chunk {
+            if run_tmutil(
+                verb,
+                std::slice::from_ref(path),
+                fixed_path,
+                TMUTIL_SINGLE_TIMEOUT,
+            )? {
+                warn!("Skipping timed-out path: {}", path.display());
+                timed_out_count += 1;
+            }
+        }
+    }
+
+    if timed_out_count > 0 {
+        warn!(
+            "tmutil {}: {} path(s) skipped due to timeout",
+            verb, timed_out_count
+        );
     }
 
     Ok(())
@@ -116,14 +151,14 @@ fn run_tmutil_batched(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<(
 
 /// Invoke `/usr/bin/tmutil <verb> [-p] <paths…>` with a timeout.
 ///
-/// The subprocess is spawned asynchronously and polled via `try_wait()`.
-/// If it does not complete within [`TMUTIL_TIMEOUT`], it is killed and the
-/// batch is skipped with a warning (non-fatal).
+/// The subprocess is spawned and polled via `try_wait()`.
+/// Returns `Ok(true)` if the call timed out (subprocess was killed),
+/// `Ok(false)` if it completed normally.
 ///
 /// Exit code 213 (path not found) is treated as non-fatal.  Any other
 /// non-zero exit code returns an error.  The `-p` flag is included only
 /// when `fixed_path` is `true`.
-fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
+fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool, timeout: Duration) -> Result<bool> {
     let mut cmd = Command::new("/usr/bin/tmutil");
     cmd.arg(verb);
     if fixed_path {
@@ -134,10 +169,11 @@ fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
     }
 
     debug!(
-        "tmutil {} {} paths (fixed_path={})",
+        "tmutil {} {} paths (fixed_path={}, timeout={}s)",
         verb,
         paths.len(),
-        fixed_path
+        fixed_path,
+        timeout.as_secs()
     );
 
     let mut child = cmd
@@ -151,19 +187,10 @@ fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
     let status = loop {
         match child.try_wait().context("checking tmutil status")? {
             Some(status) => break status,
-            None if start.elapsed() >= TMUTIL_TIMEOUT => {
+            None if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait(); // reap zombie
-                warn!(
-                    "tmutil {} timed out after {}s — skipping {} path(s)",
-                    verb,
-                    TMUTIL_TIMEOUT.as_secs(),
-                    paths.len(),
-                );
-                for p in paths {
-                    warn!("  timed-out path: {}", p.display());
-                }
-                return Ok(()); // non-fatal: continue with remaining batches
+                return Ok(true); // timed out
             }
             None => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -193,7 +220,7 @@ fn run_tmutil(verb: &str, paths: &[&Path], fixed_path: bool) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(false) // completed successfully
 }
 
 // ─── Mock implementation (for testing) ───────────────────────────────────────
