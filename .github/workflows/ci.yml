@@ -36,6 +36,13 @@ jobs:
   #
   # Fixed-path mode (`-p`) writes to /Library/Preferences/com.apple.TimeMachine.plist
   # and is NOT tested here because it requires root. Sticky mode is the default.
+  #
+  # IMPORTANT — why the fake repo lives under $HOME, not $RUNNER_TEMP:
+  # GitHub Actions registers $RUNNER_TEMP in the Time Machine fixed-path plist
+  # as part of runner setup.  macOS prefix-matches plist entries, so every path
+  # under $RUNNER_TEMP is reported as [Excluded] by `tmutil isexcluded` regardless
+  # of xattr state.  $HOME (/Users/runner) is not in the plist, so tmutil
+  # isexcluded there reflects only the xattrs letitgo actually sets.
   macos:
     name: macOS tests + real tmutil
     runs-on: macos-latest
@@ -53,11 +60,10 @@ jobs:
 
       # ── 2. Set up a fake git repo for real-tmutil tests ──────────────────────
       #
-      # We use $RUNNER_TEMP so paths are absolute, which tmutil requires.
-      # Two gitignored directories are created so we can verify both are excluded.
+      # Repo lives under $HOME so tmutil isexcluded reflects letitgo's xattrs only.
       - name: Set up fake git repo
         run: |
-          REPO="$RUNNER_TEMP/letitgo-test-repo"
+          REPO="$HOME/letitgo-test-repo"
           mkdir -p "$REPO/.git"
           mkdir -p "$REPO/target/debug"
           mkdir -p "$REPO/target/release"
@@ -78,14 +84,15 @@ jobs:
           EOF
           echo "CFG=$CFG" >> "$GITHUB_ENV"
 
-      # ── 3. Dry-run: verify the command runs cleanly without touching tmutil ──────
-      #
-      # We cannot assert [Not excluded] here: GitHub-hosted macOS runners may have
-      # the work/temp directories pre-excluded in their Time Machine configuration,
-      # making the check environment-dependent. The --dry-run flag is already
-      # covered by unit tests; here we just verify the command exits successfully.
-      - name: letitgo run --dry-run (command must exit 0)
+      # ── 3. Dry-run: verify no real tmutil calls are made ─────────────────────
+      - name: letitgo run --dry-run (no exclusions should be set)
         run: ./target/debug/letitgo --config "$CFG" --dry-run run --search-path "$REPO"
+
+      - name: Verify dry-run made no exclusions (target/)
+        run: tmutil isexcluded "$REPO/target" | grep -q '\[Not excluded\]'
+
+      - name: Verify dry-run made no exclusions (node_modules/)
+        run: tmutil isexcluded "$REPO/node_modules" | grep -q '\[Not excluded\]'
 
       # ── 4. Real run: letitgo calls tmutil addexclusion ────────────────────────
       - name: letitgo run (adds exclusions via real tmutil)
@@ -142,9 +149,10 @@ jobs:
       # If an earlier step failed while exclusions were set, this ensures the
       # runner is left clean.  Errors are suppressed since the binary or config
       # may not exist if the build itself failed.
-      - name: Cleanup — remove any lingering exclusions
+      - name: Cleanup — remove any lingering exclusions and test repo
         if: always()
         run: |
           if [ -f ./target/debug/letitgo ] && [ -n "${CFG:-}" ]; then
             ./target/debug/letitgo --config "$CFG" reset --yes 2>/dev/null || true
           fi
+          rm -rf "$HOME/letitgo-test-repo"
