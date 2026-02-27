@@ -53,10 +53,14 @@ impl AppContext {
     fn production() -> Self {
         let config_path = default_config_path();
         let cache_path = default_cache_path();
+        let lock_path = cache_path
+            .parent()
+            .unwrap_or(Path::new("/tmp"))
+            .join("letitgo.lock");
         AppContext {
             config_path,
             cache_path,
-            lock_path: PathBuf::from("/tmp/letitgo.lock"),
+            lock_path,
             exclusion_manager: Box::new(TmutilManager),
         }
     }
@@ -387,6 +391,13 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
         }
     }
 
+    // Acquire lock after confirmation prompt (before any mutations)
+    let lock_file = acquire_lock(&ctx.lock_path)?;
+    let Some(_guard) = lock_file else {
+        warn!("Another letitgo instance is running. Skipping.");
+        return Ok(());
+    };
+
     let fixed_path = config.exclusion_mode.is_fixed_path();
 
     if dry_run {
@@ -417,6 +428,13 @@ fn cmd_reset(ctx: &AppContext, config: &Config, yes: bool, dry_run: bool) -> Res
 /// Delegates to [`clean::clean_stale`].  When `dry_run` is `true`, reports the
 /// count of stale paths but does not modify the cache or call `tmutil`.
 fn cmd_clean(ctx: &AppContext, config: &Config, dry_run: bool) -> Result<()> {
+    // Acquire lock — clean mutates the cache
+    let lock_file = acquire_lock(&ctx.lock_path)?;
+    let Some(_guard) = lock_file else {
+        warn!("Another letitgo instance is running. Skipping.");
+        return Ok(());
+    };
+
     let fixed_path = config.exclusion_mode.is_fixed_path();
     let removed = clean::clean_stale(
         &ctx.cache_path,

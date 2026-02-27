@@ -42,14 +42,15 @@ impl Cache {
 
 /// Load the cache from `path`. Returns an empty cache if the file does not exist.
 pub fn load_cache(path: &Path) -> Result<Cache> {
-    if !path.exists() {
-        return Ok(Cache::empty());
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let cache: Cache = serde_json::from_str(&text)
+                .with_context(|| format!("parsing cache: {}", path.display()))?;
+            Ok(cache)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cache::empty()),
+        Err(e) => Err(e).with_context(|| format!("reading cache: {}", path.display())),
     }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("reading cache: {}", path.display()))?;
-    let cache: Cache = serde_json::from_str(&text)
-        .with_context(|| format!("parsing cache: {}", path.display()))?;
-    Ok(cache)
 }
 
 /// Write the cache to `path` atomically.

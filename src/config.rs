@@ -145,14 +145,17 @@ impl Config {
     /// Load config from `path`. Returns `(Config, found)` — if the file does
     /// not exist, returns the default config and `found = false`.
     pub fn load(path: &Path) -> Result<(Self, bool)> {
-        if !path.exists() {
-            return Ok((Config::default(), false));
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let config: Config = toml::from_str(&text)
+                    .with_context(|| format!("parsing config file: {}", path.display()))?;
+                Ok((config, true))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Config::default(), false)),
+            Err(e) => {
+                Err(e).with_context(|| format!("reading config file: {}", path.display()))
+            }
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file: {}", path.display()))?;
-        let config: Config = toml::from_str(&text)
-            .with_context(|| format!("parsing config file: {}", path.display()))?;
-        Ok((config, true))
     }
 
     /// Expand `~` in every entry of `search_paths` and return absolute `PathBuf`s.
