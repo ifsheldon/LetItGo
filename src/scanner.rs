@@ -39,12 +39,10 @@ pub fn discover_repos(search_paths: &[PathBuf], ignored_paths: &[PathBuf]) -> Ve
 
                 let path = entry.path();
 
-                // Skip configured ignored paths
-                for ignored in ignored_paths {
-                    if path.starts_with(ignored) {
-                        debug!("Skipping ignored path: {}", path.display());
-                        return WalkState::Skip;
-                    }
+                // Skip configured ignored paths (linear scan; fine for typical ~6 entries)
+                if ignored_paths.iter().any(|ig| path.starts_with(ig)) {
+                    debug!("Skipping ignored path: {}", path.display());
+                    return WalkState::Skip;
                 }
 
                 // We're looking for .git entries — either a directory (regular repos)

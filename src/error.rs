@@ -3,7 +3,7 @@
 /// Known safe codes:
 /// - 213: path not found (item was already removed / never existed)
 pub fn is_tmutil_safe_error(exit_code: i32) -> bool {
-    matches!(exit_code, 213)
+    exit_code == 213
 }
 
 #[cfg(test)]

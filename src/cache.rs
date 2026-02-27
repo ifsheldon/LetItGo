@@ -65,9 +65,15 @@ pub fn write_cache(path: &Path, cache: &Cache) -> Result<()> {
         .with_context(|| format!("creating cache dir: {}", parent.display()))?;
 
     // Sort paths for deterministic output (easier to diff/debug).
-    let mut cache = cache.clone();
-    cache.paths.sort();
-    let text = serde_json::to_string_pretty(&cache).context("serializing cache")?;
+    let mut sorted_paths = cache.paths.clone();
+    sorted_paths.sort();
+    let sorted_cache = Cache {
+        version: cache.version,
+        last_run: cache.last_run,
+        exclusion_mode: cache.exclusion_mode.clone(),
+        paths: sorted_paths,
+    };
+    let text = serde_json::to_string_pretty(&sorted_cache).context("serializing cache")?;
 
     // Write to a sibling temp file, then atomically rename into place.
     let mut tmp = NamedTempFile::new_in(parent)
