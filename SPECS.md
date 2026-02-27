@@ -339,17 +339,21 @@ src/
  8. Batch tmutil calls — adds and removes are separate verbs but both accept
     multiple paths per invocation. Chunk each set at ~200 paths/call to stay
     well under macOS ARG_MAX (≈256 KB). The two sets are independent and can
-    run in parallel via rayon:
+    run in parallel via std::thread::scope:
     - paths_to_add in chunks    → tmutil addexclusion    [-p] path1 path2 ... path200
     - paths_to_remove in chunks → tmutil removeexclusion [-p] path1 path2 ... path200
     In practice the diff is usually small (a handful of paths), so most runs
     produce only 1–2 tmutil invocations total. The initial run on a fresh machine
     may have thousands of paths, making chunking important.
- 9. Write cache atomically: serialise new_set + timestamp + exclusion_mode to a
-    sibling NamedTempFile, then rename(2) it into place. The advisory lock is
-    held during this step. If the process is killed at any point, the previous
-    cache file remains intact (rename is atomic on POSIX; the temp file is
-    reclaimed by the OS).
+    **Error handling:** If either add or remove fails, the error is propagated
+    and the cache is NOT written. This is safe because tmutil operations are
+    idempotent — the next run recomputes the full diff and retries everything.
+    Paths that were successfully processed become harmless no-ops on retry.
+ 9. Write cache atomically (only on success of step 8): serialise new_set +
+    timestamp + exclusion_mode to a sibling NamedTempFile, then rename(2) it
+    into place. The advisory lock is held during this step. If the process is
+    killed at any point, the previous cache file remains intact (rename is
+    atomic on POSIX; the temp file is reclaimed by the OS).
 10. Release lockfile (or: lock is released automatically by the OS when the
     process exits — flock(2) is per-open-file-description, not per-process).
 11. Log summary (# added, # removed, # total, duration)
@@ -384,12 +388,17 @@ Pass 1 — Collect ignored paths (single walk with incremental .gitignore discov
 
 Pass 2 — Apply .lignore overrides (exact-match negation only):
 
-  3. Load .lignore files into a second GitignoreBuilder, with each .lignore
-     file rooted at the same directory as its co-located .gitignore — mirroring
-     standard gitignore path scoping. A .lignore at repo-root/ has global scope
-     (can reference paths produced by any subdirectory .gitignore); a .lignore
-     at src/ is scoped to paths under src/.
+  3. Discover .lignore files by walking the repo tree. The walk skips .git
+     directories and already-excluded subtrees (e.g. node_modules/) to avoid
+     re-traversing large pruned trees. Walk errors are logged as warnings.
+     Each .lignore is rooted at the same directory as its co-located
+     .gitignore — mirroring standard gitignore path scoping. A .lignore at
+     repo-root/ has global scope (can reference paths produced by any
+     subdirectory .gitignore); a .lignore at src/ is scoped to paths under
+     src/.
   4. For plain (non-negated) lines in .lignore:
+     - Walk the .lignore's directory to find matching paths, again skipping
+       .git and already-excluded subtrees for efficiency.
      - Add matching paths to the exclusion set (additional exclusions).
   5. For negation patterns (lines starting with `!`):
      a. Resolve the negated pattern to an absolute path.
