@@ -11,6 +11,7 @@ search_paths = ["~"]
 
 # Directories to skip during scan
 ignored_paths = [
+    "~/.cache",
     "~/.Trash",
     "~/Applications",
     "~/Downloads",
