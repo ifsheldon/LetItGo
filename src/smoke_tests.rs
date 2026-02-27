@@ -76,7 +76,9 @@ fn cleanup(ctx: &AppContext, config: &Config) {
 #[test]
 #[ignore]
 fn smoke_core_dry_run_no_xattrs() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -84,14 +86,22 @@ fn smoke_core_dry_run_no_xattrs() {
 
     cmd_run(&ctx, &config, &[], true /* dry_run */).unwrap();
 
-    assert!(!has_xattr(&repo.join("target")), "dry-run must not set xattr on target/");
-    assert!(!has_xattr(&repo.join("node_modules")), "dry-run must not set xattr on node_modules/");
+    assert!(
+        !has_xattr(&repo.join("target")),
+        "dry-run must not set xattr on target/"
+    );
+    assert!(
+        !has_xattr(&repo.join("node_modules")),
+        "dry-run must not set xattr on node_modules/"
+    );
 }
 
 #[test]
 #[ignore]
 fn smoke_core_run_sets_xattrs() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -100,7 +110,10 @@ fn smoke_core_run_sets_xattrs() {
     cmd_run(&ctx, &config, &[], false).unwrap();
 
     assert!(has_xattr(&repo.join("target")), "target/ should have xattr");
-    assert!(has_xattr(&repo.join("node_modules")), "node_modules/ should have xattr");
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "node_modules/ should have xattr"
+    );
     let cache = load_cache(&ctx.cache_path).unwrap();
     assert!(cache.path_set().contains(&repo.join("target")));
     assert!(cache.path_set().contains(&repo.join("node_modules")));
@@ -111,7 +124,9 @@ fn smoke_core_run_sets_xattrs() {
 #[test]
 #[ignore]
 fn smoke_core_list_json_count() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -120,7 +135,11 @@ fn smoke_core_list_json_count() {
     cmd_run(&ctx, &config, &[], false).unwrap();
 
     let cache = load_cache(&ctx.cache_path).unwrap();
-    assert!(cache.paths.len() >= 2, "expected >= 2 paths, got {}", cache.paths.len());
+    assert!(
+        cache.paths.len() >= 2,
+        "expected >= 2 paths, got {}",
+        cache.paths.len()
+    );
 
     cleanup(&ctx, &config);
 }
@@ -128,7 +147,9 @@ fn smoke_core_list_json_count() {
 #[test]
 #[ignore]
 fn smoke_core_clean_noop() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -139,7 +160,10 @@ fn smoke_core_clean_noop() {
 
     cmd_clean(&ctx, &config, false).unwrap();
     let count_after = load_cache(&ctx.cache_path).unwrap().paths.len();
-    assert_eq!(count_before, count_after, "clean should not change anything when no paths are stale");
+    assert_eq!(
+        count_before, count_after,
+        "clean should not change anything when no paths are stale"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -147,7 +171,9 @@ fn smoke_core_clean_noop() {
 #[test]
 #[ignore]
 fn smoke_core_idempotent_rerun() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -156,8 +182,14 @@ fn smoke_core_idempotent_rerun() {
     cmd_run(&ctx, &config, &[], false).unwrap();
     cmd_run(&ctx, &config, &[], false).unwrap(); // second run
 
-    assert!(has_xattr(&repo.join("target")), "xattr must survive idempotent re-run");
-    assert!(has_xattr(&repo.join("node_modules")), "xattr must survive idempotent re-run");
+    assert!(
+        has_xattr(&repo.join("target")),
+        "xattr must survive idempotent re-run"
+    );
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "xattr must survive idempotent re-run"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -165,7 +197,9 @@ fn smoke_core_idempotent_rerun() {
 #[test]
 #[ignore]
 fn smoke_core_reset_removes_xattrs() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -176,9 +210,18 @@ fn smoke_core_reset_removes_xattrs() {
 
     cmd_reset(&ctx, &config, true, false).unwrap();
 
-    assert!(!has_xattr(&repo.join("target")), "reset must remove xattr from target/");
-    assert!(!has_xattr(&repo.join("node_modules")), "reset must remove xattr from node_modules/");
-    assert!(!ctx.cache_path.exists(), "cache must be deleted after reset");
+    assert!(
+        !has_xattr(&repo.join("target")),
+        "reset must remove xattr from target/"
+    );
+    assert!(
+        !has_xattr(&repo.join("node_modules")),
+        "reset must remove xattr from node_modules/"
+    );
+    assert!(
+        !ctx.cache_path.exists(),
+        "cache must be deleted after reset"
+    );
 }
 
 // ── .lignore + whitelist smoke tests ─────────────────────────────────────
@@ -186,7 +229,9 @@ fn smoke_core_reset_removes_xattrs() {
 #[test]
 #[ignore]
 fn smoke_lignore_negation() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     fs::write(repo.join(".lignore"), "!target/\n").unwrap();
@@ -195,8 +240,14 @@ fn smoke_lignore_negation() {
 
     cmd_run(&ctx, &config, &[], false).unwrap();
 
-    assert!(!has_xattr(&repo.join("target")), ".lignore negated target/ — must not have xattr");
-    assert!(has_xattr(&repo.join("node_modules")), "node_modules/ still excluded");
+    assert!(
+        !has_xattr(&repo.join("target")),
+        ".lignore negated target/ — must not have xattr"
+    );
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "node_modules/ still excluded"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -204,7 +255,9 @@ fn smoke_lignore_negation() {
 #[test]
 #[ignore]
 fn smoke_lignore_addition() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
@@ -217,8 +270,14 @@ fn smoke_lignore_addition() {
 
     cmd_run(&ctx, &config, &[], false).unwrap();
 
-    assert!(has_xattr(&repo.join("target")), "target/ excluded via .gitignore");
-    assert!(has_xattr(&repo.join("data")), "data/ excluded via .lignore addition");
+    assert!(
+        has_xattr(&repo.join("target")),
+        "target/ excluded via .gitignore"
+    );
+    assert!(
+        has_xattr(&repo.join("data")),
+        "data/ excluded via .lignore addition"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -226,7 +285,9 @@ fn smoke_lignore_addition() {
 #[test]
 #[ignore]
 fn smoke_lignore_combined() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     fs::create_dir_all(repo.join("data")).unwrap();
@@ -237,7 +298,10 @@ fn smoke_lignore_combined() {
     cmd_run(&ctx, &config, &[], false).unwrap();
 
     assert!(!has_xattr(&repo.join("target")), "target/ negated");
-    assert!(has_xattr(&repo.join("node_modules")), "node_modules/ still excluded");
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "node_modules/ still excluded"
+    );
     assert!(has_xattr(&repo.join("data")), "data/ added by .lignore");
 
     cleanup(&ctx, &config);
@@ -246,7 +310,9 @@ fn smoke_lignore_combined() {
 #[test]
 #[ignore]
 fn smoke_lignore_nested() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     fs::create_dir_all(repo.join("src/generated")).unwrap();
@@ -257,7 +323,10 @@ fn smoke_lignore_nested() {
     cmd_run(&ctx, &config, &[], false).unwrap();
 
     assert!(has_xattr(&repo.join("target")), "target/ via .gitignore");
-    assert!(has_xattr(&repo.join("src/generated")), "src/generated/ via nested .lignore");
+    assert!(
+        has_xattr(&repo.join("src/generated")),
+        "src/generated/ via nested .lignore"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -265,7 +334,9 @@ fn smoke_lignore_nested() {
 #[test]
 #[ignore]
 fn smoke_lignore_whitelist() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
@@ -278,7 +349,10 @@ fn smoke_lignore_whitelist() {
     cmd_run(&ctx, &config, &[], false).unwrap();
 
     assert!(has_xattr(&repo.join("target")), "target/ excluded");
-    assert!(!has_xattr(&repo.join(".env")), ".env whitelisted — must not have xattr");
+    assert!(
+        !has_xattr(&repo.join(".env")),
+        ".env whitelisted — must not have xattr"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -286,7 +360,9 @@ fn smoke_lignore_whitelist() {
 #[test]
 #[ignore]
 fn smoke_lignore_whitelist_multi() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
@@ -302,7 +378,10 @@ fn smoke_lignore_whitelist_multi() {
 
     assert!(has_xattr(&repo.join("target")), "target/ excluded");
     assert!(!has_xattr(&repo.join(".env")), ".env whitelisted");
-    assert!(!has_xattr(&repo.join("config/application.yml")), "application.yml whitelisted");
+    assert!(
+        !has_xattr(&repo.join("config/application.yml")),
+        "application.yml whitelisted"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -312,7 +391,9 @@ fn smoke_lignore_whitelist_multi() {
 #[test]
 #[ignore]
 fn smoke_advanced_incremental() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
@@ -340,7 +421,9 @@ fn smoke_advanced_incremental() {
 #[test]
 #[ignore]
 fn smoke_advanced_stale_cleanup() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -355,7 +438,12 @@ fn smoke_advanced_stale_cleanup() {
     // Clean should remove the stale entry
     cmd_clean(&ctx, &config, false).unwrap();
     let after = load_cache(&ctx.cache_path).unwrap().paths.len();
-    assert!(after < before, "clean must reduce count: {} -> {}", before, after);
+    assert!(
+        after < before,
+        "clean must reduce count: {} -> {}",
+        before,
+        after
+    );
 
     cleanup(&ctx, &config);
 }
@@ -363,7 +451,9 @@ fn smoke_advanced_stale_cleanup() {
 #[test]
 #[ignore]
 fn smoke_advanced_multi_repo() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let root = tmp.path().join("projects");
 
@@ -391,7 +481,9 @@ fn smoke_advanced_multi_repo() {
 #[test]
 #[ignore]
 fn smoke_advanced_nested_gitignore() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
@@ -404,7 +496,10 @@ fn smoke_advanced_nested_gitignore() {
 
     cmd_run(&ctx, &config, &[], false).unwrap();
 
-    assert!(has_xattr(&repo.join("src/vendor")), "src/vendor/ excluded by nested .gitignore");
+    assert!(
+        has_xattr(&repo.join("src/vendor")),
+        "src/vendor/ excluded by nested .gitignore"
+    );
     assert!(!has_xattr(&repo.join("src/main")), "src/main/ not excluded");
     assert!(!has_xattr(&repo.join("src")), "src/ itself not excluded");
 
@@ -414,7 +509,9 @@ fn smoke_advanced_nested_gitignore() {
 #[test]
 #[ignore]
 fn smoke_advanced_file_level_pattern() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("repo");
     fs::create_dir_all(repo.join(".git")).unwrap();
@@ -427,7 +524,10 @@ fn smoke_advanced_file_level_pattern() {
 
     cmd_run(&ctx, &config, &[], false).unwrap();
 
-    assert!(has_xattr(&repo.join("logs/debug.log")), "debug.log excluded by *.log");
+    assert!(
+        has_xattr(&repo.join("logs/debug.log")),
+        "debug.log excluded by *.log"
+    );
     assert!(!has_xattr(&repo.join("logs/app.rs")), "app.rs not excluded");
     assert!(!has_xattr(&repo.join("logs")), "logs/ dir not excluded");
 
@@ -437,7 +537,9 @@ fn smoke_advanced_file_level_pattern() {
 #[test]
 #[ignore]
 fn smoke_advanced_init() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let ctx = make_real_ctx(tmp.path());
 
@@ -445,7 +547,10 @@ fn smoke_advanced_init() {
     cmd_init(&ctx, false).unwrap();
     assert!(ctx.config_path.exists(), "config must be created");
     let content = fs::read_to_string(&ctx.config_path).unwrap();
-    assert!(content.contains("search_paths"), "config must contain search_paths");
+    assert!(
+        content.contains("search_paths"),
+        "config must contain search_paths"
+    );
 
     // init without --force preserves existing
     let original = content.clone();
@@ -460,13 +565,18 @@ fn smoke_advanced_init() {
     fs::write(&ctx.config_path, "# corrupted\n").unwrap();
     cmd_init(&ctx, true).unwrap();
     let restored = fs::read_to_string(&ctx.config_path).unwrap();
-    assert!(restored.contains("search_paths"), "--force must restore content");
+    assert!(
+        restored.contains("search_paths"),
+        "--force must restore content"
+    );
 }
 
 #[test]
 #[ignore]
 fn smoke_advanced_submodule() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = tmp.path().join("submod");
     fs::create_dir_all(&repo).unwrap();
@@ -479,7 +589,10 @@ fn smoke_advanced_submodule() {
 
     cmd_run(&ctx, &config, &[], false).unwrap();
 
-    assert!(has_xattr(&repo.join("target")), "submodule target/ excluded");
+    assert!(
+        has_xattr(&repo.join("target")),
+        "submodule target/ excluded"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -487,7 +600,9 @@ fn smoke_advanced_submodule() {
 #[test]
 #[ignore]
 fn smoke_advanced_full_cycle() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -496,17 +611,32 @@ fn smoke_advanced_full_cycle() {
     // Run
     cmd_run(&ctx, &config, &[], false).unwrap();
     assert!(has_xattr(&repo.join("target")), "cycle: run sets xattr");
-    assert!(has_xattr(&repo.join("node_modules")), "cycle: run sets xattr");
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "cycle: run sets xattr"
+    );
 
     // Reset
     cmd_reset(&ctx, &config, true, false).unwrap();
-    assert!(!has_xattr(&repo.join("target")), "cycle: reset clears xattr");
-    assert!(!has_xattr(&repo.join("node_modules")), "cycle: reset clears xattr");
+    assert!(
+        !has_xattr(&repo.join("target")),
+        "cycle: reset clears xattr"
+    );
+    assert!(
+        !has_xattr(&repo.join("node_modules")),
+        "cycle: reset clears xattr"
+    );
 
     // Re-run
     cmd_run(&ctx, &config, &[], false).unwrap();
-    assert!(has_xattr(&repo.join("target")), "cycle: re-run restores xattr");
-    assert!(has_xattr(&repo.join("node_modules")), "cycle: re-run restores xattr");
+    assert!(
+        has_xattr(&repo.join("target")),
+        "cycle: re-run restores xattr"
+    );
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "cycle: re-run restores xattr"
+    );
 
     cleanup(&ctx, &config);
 }
@@ -514,7 +644,9 @@ fn smoke_advanced_full_cycle() {
 #[test]
 #[ignore]
 fn smoke_advanced_removal() {
-    if !require_smoke() { return; }
+    if !require_smoke() {
+        return;
+    }
     let tmp = tempdir().unwrap();
     let repo = make_repo(tmp.path(), "repo");
     let ctx = make_real_ctx(tmp.path());
@@ -523,15 +655,24 @@ fn smoke_advanced_removal() {
     // First run — both excluded
     cmd_run(&ctx, &config, &[], false).unwrap();
     assert!(has_xattr(&repo.join("target")), "target/ excluded");
-    assert!(has_xattr(&repo.join("node_modules")), "node_modules/ excluded");
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "node_modules/ excluded"
+    );
 
     // Drop target/ from .gitignore
     fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
 
     // Second run — target/ un-excluded
     cmd_run(&ctx, &config, &[], false).unwrap();
-    assert!(!has_xattr(&repo.join("target")), "target/ un-excluded after pattern removed");
-    assert!(has_xattr(&repo.join("node_modules")), "node_modules/ still excluded");
+    assert!(
+        !has_xattr(&repo.join("target")),
+        "target/ un-excluded after pattern removed"
+    );
+    assert!(
+        has_xattr(&repo.join("node_modules")),
+        "node_modules/ still excluded"
+    );
 
     cleanup(&ctx, &config);
 }
