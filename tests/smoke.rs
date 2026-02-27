@@ -10,7 +10,7 @@
 
 use letitgo::cache::load_cache;
 use letitgo::config::{Config, ExclusionMode};
-use letitgo::tmutil::TmutilManager;
+use letitgo::tmutil::{BACKUP_EXCLUDE_XATTR, BACKUP_EXCLUDE_XATTR_VALUE, TmutilManager};
 use letitgo::{AppContext, cmd_clean, cmd_init, cmd_reset, cmd_run};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,15 +37,14 @@ fn make_real_ctx(tmp: &Path) -> AppContext {
 }
 
 /// Check whether `com.apple.metadata:com_apple_backup_excludeItem` xattr
-/// is set on `path`.  Uses `/usr/bin/xattr` directly instead of
+/// is set on `path`.  Uses the `xattr` crate (a direct syscall) instead of
 /// `tmutil isexcluded` because the latter inherits from parent dirs (and
 /// CI runners pre-exclude $HOME).
 fn has_xattr(path: &Path) -> bool {
-    let output = Command::new("/usr/bin/xattr")
-        .arg(path)
-        .output()
-        .expect("failed to run /usr/bin/xattr");
-    String::from_utf8_lossy(&output.stdout).contains("com_apple_backup_excludeItem")
+    xattr::get(path, BACKUP_EXCLUDE_XATTR)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Create a minimal git repo fixture with `target/` and `node_modules/`.
@@ -678,4 +677,76 @@ fn smoke_advanced_removal() {
     );
 
     cleanup(&ctx, &config);
+}
+
+// ── xattr value verification ──────────────────────────────────────────────
+
+/// Read the raw bytes of the backup-exclusion xattr from `path`.
+fn read_xattr_value(path: &Path) -> Vec<u8> {
+    xattr::get(path, BACKUP_EXCLUDE_XATTR)
+        .expect("xattr::get failed")
+        .expect("xattr not present on path")
+}
+
+#[test]
+#[ignore]
+fn smoke_xattr_value_matches_tmutil() {
+    if !require_smoke() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+
+    // 1) Let tmutil set the xattr (ground truth)
+    let tmutil_file = tmp.path().join("tmutil_file");
+    fs::write(&tmutil_file, "").unwrap();
+    let status = Command::new("/usr/bin/tmutil")
+        .arg("addexclusion")
+        .arg(&tmutil_file)
+        .status()
+        .expect("failed to run tmutil");
+    assert!(status.success(), "tmutil addexclusion failed");
+    let tmutil_value = read_xattr_value(&tmutil_file);
+
+    // 2) Verify our constant matches tmutil's output byte-for-byte
+    assert_eq!(
+        BACKUP_EXCLUDE_XATTR_VALUE,
+        tmutil_value.as_slice(),
+        "BACKUP_EXCLUDE_XATTR_VALUE does not match what tmutil writes!\n\
+         expected (tmutil): {:02X?}\n\
+         got (our const):   {:02X?}",
+        tmutil_value,
+        BACKUP_EXCLUDE_XATTR_VALUE,
+    );
+
+    // 3) Set via our direct xattr path and verify it also matches
+    let direct_file = tmp.path().join("direct_file");
+    fs::write(&direct_file, "").unwrap();
+    xattr::set(
+        &direct_file,
+        BACKUP_EXCLUDE_XATTR,
+        BACKUP_EXCLUDE_XATTR_VALUE,
+    )
+    .expect("xattr::set failed");
+    let direct_value = read_xattr_value(&direct_file);
+
+    assert_eq!(
+        tmutil_value, direct_value,
+        "xattr::set value does not match tmutil value!\n\
+         tmutil:  {:02X?}\n\
+         direct:  {:02X?}",
+        tmutil_value, direct_value,
+    );
+
+    // 4) Verify tmutil isexcluded recognises our directly-set xattr
+    let output = Command::new("/usr/bin/tmutil")
+        .arg("isexcluded")
+        .arg(&direct_file)
+        .output()
+        .expect("failed to run tmutil isexcluded");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[Excluded]"),
+        "tmutil isexcluded must recognise our direct xattr, got: {}",
+        stdout,
+    );
 }
