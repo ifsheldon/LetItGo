@@ -88,7 +88,7 @@ data/large-dataset/   → additionally exclude from TM (may or may not be in .gi
 
 ## 3. CLI Interface
 
-```
+```text
 letitgo <COMMAND> [OPTIONS]
 
 Commands:
@@ -107,7 +107,7 @@ Global Options:
 
 ### 3.1 `run` subcommand
 
-```
+```text
 letitgo run [OPTIONS]
 
 Options:
@@ -118,12 +118,56 @@ Scans search paths, computes exclusions, diffs against cache, updates Time Machi
 
 ### 3.2 `list` subcommand
 
-```
+```text
 letitgo list [OPTIONS]
 
 Options:
   --json                Output as JSON
   --stale               Show only paths that no longer exist on disk
+```
+
+**Default output (plain text, one path per line):**
+
+```text
+5 paths excluded from Time Machine:
+
+  /Users/alice/projects/web-app/node_modules
+  /Users/alice/projects/web-app/.parcel-cache
+  /Users/alice/projects/api/target
+  /Users/alice/projects/api/.cargo
+  /Users/alice/Desktop/game/build
+```
+
+**`--stale` output:**
+
+```text
+2 stale paths (no longer exist on disk):
+
+  /Users/alice/old-project/node_modules   [deleted]
+  /Users/alice/tmp/build                  [deleted]
+```
+
+**Color:** Auto-detected — enabled only when stdout is a TTY, disabled when
+piped or redirected. Uses `owo-colors` with `if_supports_color()`. Respects
+`NO_COLOR` env var. Color scheme (TTY only):
+
+- Count header → bold
+- Normal paths → default terminal color
+- `[deleted]` tag on stale paths → yellow
+- Zero-result message (e.g. "No paths excluded") → dim
+
+**`--json` output:**
+
+```json
+{
+  "count": 5,
+  "last_run": "2026-02-27T02:00:00+08:00",
+  "exclusion_mode": "sticky",
+  "paths": [
+    "/Users/alice/projects/web-app/node_modules",
+    "..."
+  ]
+}
 ```
 
 ### 3.3 `clean` subcommand
@@ -159,13 +203,31 @@ Options:
 
 Creates a default `~/.config/letitgo/config.toml` with all options documented via inline comments. If the config file already exists, prints a message and exits (unless `--force` is used).
 
+### 3.6 stdout vs stderr
+
+| Stream | Content |
+|---|---|
+| **stdout** | Machine-readable data only: `list` paths (plain text), `list --json` output |
+| **stderr** | All human-readable diagnostics: hints, warnings, progress, log lines (via `tracing`) |
+
+This invariant ensures `letitgo list --json | jq .` and `letitgo list | wc -l` always
+work cleanly. No diagnostic message ever leaks onto stdout.
+
+The first-run hint is emitted as `tracing::warn!()`, which goes to stderr automatically:
+
+```text
+WARN letitgo: No config file found at ~/.config/letitgo/config.toml — using defaults.
+              Run `letitgo init` to create one.
+```
+
 ---
 
 ## 4. Configuration
 
 **Location:** `~/.config/letitgo/config.toml`
 
-On first run of any command (except `init`), if no config file exists, `letitgo` runs with sensible defaults and prints a one-time hint: _"No config found, using defaults. Run `letitgo init` to create one."_
+On first run of any command (except `init`), if no config file exists, `letitgo` runs
+with sensible defaults and emits a hint **to stderr** via `tracing::warn!()`:
 
 ```toml
 # Directories to scan for Git repos
@@ -233,6 +295,7 @@ The `ignore` crate (by BurntSushi, the ripgrep author) provides `WalkBuilder::bu
 | `chrono` | Timestamps in cache |
 | `walkdir` | Raw directory traversal for the two-pass ignore resolution |
 | `fd-lock` | Advisory file locking for `/tmp/letitgo.lock` |
+| `owo-colors` | TTY-aware terminal colors (auto-disables when piped) |
 
 ### 5.4 Module Structure
 
@@ -270,9 +333,15 @@ src/
  7. Diff against cache:
     - paths_to_add    = new_set - cached_set
     - paths_to_remove = cached_set - new_set
- 8. Batch tmutil calls (chunk by ~200 paths per invocation):
-    - For paths_to_add:    tmutil addexclusion [-p] <chunk>
-    - For paths_to_remove: tmutil removeexclusion [-p] <chunk>
+ 8. Batch tmutil calls — adds and removes are separate verbs but both accept
+    multiple paths per invocation. Chunk each set at ~200 paths/call to stay
+    well under macOS ARG_MAX (≈256 KB). The two sets are independent and can
+    run in parallel via rayon:
+    - paths_to_add in chunks    → tmutil addexclusion    [-p] path1 path2 ... path200
+    - paths_to_remove in chunks → tmutil removeexclusion [-p] path1 path2 ... path200
+    In practice the diff is usually small (a handful of paths), so most runs
+    produce only 1–2 tmutil invocations total. The initial run on a fresh machine
+    may have thousands of paths, making chunking important.
  9. Update cache file with new_set + timestamp + exclusion_mode
 10. Release lockfile
 11. Log summary (# added, # removed, # total, duration)
@@ -296,24 +365,44 @@ Pass 1 — Collect ignored directories (with pruning):
      - Match::Ignore + is_file → add to excluded_files (optional, see note)
      - Match::None / Match::Whitelist → continue walking
 
-Pass 2 — Apply .lignore overrides (same-level only):
+Pass 2 — Apply .lignore overrides (exact-match negation only):
 
-  4. Load co-located .lignore files into a second GitignoreBuilder.
+  4. Load .lignore files into a second GitignoreBuilder, with each .lignore
+     file rooted at the same directory as its co-located .gitignore — mirroring
+     standard gitignore path scoping. A .lignore at repo-root/ has global scope
+     (can reference paths produced by any subdirectory .gitignore); a .lignore
+     at src/ is scoped to paths under src/.
   5. For plain (non-negated) lines in .lignore:
      - Add matching paths to the exclusion set (additional exclusions).
   6. For negation patterns (lines starting with `!`):
-     a. If the negated path exactly matches an entry in the exclusion set
-        (same-level), remove it. E.g. `!target/` removes `target/`.
-     b. If the negated path is a SUB-PATH of an excluded directory
-        (e.g., `!target/release/` while `target/` is excluded),
-        emit a runtime warning and skip:
+     a. Resolve the negated pattern to an absolute path.
+     b. If that absolute path is a DIRECT ENTRY in the exclusion set, remove
+        it. E.g. `!target/` in repo-root/.lignore removes `repo-root/target/`
+        from the set. This works regardless of which .gitignore file (root-
+        level or subdirectory) originally caused the path to be excluded.
+     c. If the resolved path is a SUB-PATH of an excluded directory entry
+        (i.e., an entry in the exclusion set is a prefix of the negated path —
+        e.g., `!target/release/` while `target/` is in the set), emit a
+        runtime warning and skip:
 
         WARN: .lignore negation `!target/release/` targets a sub-path of
               excluded directory `target/`. Sub-path negation is not yet
               supported — `target/` remains fully excluded from backups.
+              Workaround: use `!target/` to fully un-exclude the directory.
 
   7. Apply whitelist from config: remove paths matching whitelist globs.
 ```
+
+> [!NOTE]
+> **"Exact-match negation" clarified:** The restriction is about _pattern depth
+> in the exclusion set_, not about _file co-location_. A root-level `.lignore`
+> with `!src/vendor/` **can** remove `src/vendor/` from the exclusion set even
+> if it was originally excluded by `src/.gitignore` — because the exclusion set
+> is a flat `HashSet` of resolved absolute paths and the match is by equality.
+> The limitation only applies when the negated path is _inside_ a directory that
+> was pruned whole (and therefore its children were never individually recorded).
+
+<!-- -->
 
 > [!NOTE]
 > **Directory-level vs file-level exclusion:** For efficiency, we primarily
@@ -464,19 +553,25 @@ The core architectural decision for testability: abstract `tmutil` behind a trai
 Production code calls the real binary; tests use a mock that records calls.
 
 ```rust
-pub trait ExclusionManager {
+// Send + Sync required: AppContext (which owns Box<dyn ExclusionManager>) may be
+// referenced from rayon scopes even though ExclusionManager itself is only *called*
+// after rayon's parallel section completes. Without Send + Sync, the borrow checker
+// will reject any code that passes a reference to AppContext into a rayon::scope.
+pub trait ExclusionManager: Send + Sync {
     fn add_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
     fn remove_exclusions(&self, paths: &[PathBuf], fixed_path: bool) -> Result<()>;
     fn is_excluded(&self, path: &Path) -> Result<bool>;
 }
 
-/// Production: calls /usr/bin/tmutil
+/// Production: stateless, trivially Send + Sync — calls /usr/bin/tmutil
 pub struct TmutilManager;
 
-/// Tests: records calls in-memory, never touches the system
+/// Tests: records calls in-memory, never touches the system.
+/// Uses Mutex (not RefCell) to satisfy Send + Sync.
+/// Lock contention is negligible — only a handful of calls per test.
 pub struct MockExclusionManager {
-    pub added: RefCell<Vec<PathBuf>>,
-    pub removed: RefCell<Vec<PathBuf>>,
+    pub added: Mutex<Vec<PathBuf>>,
+    pub removed: Mutex<Vec<PathBuf>>,
 }
 ```
 
